@@ -1507,7 +1507,7 @@ impl AuthorityState {
         let (kind, signer, _) = transaction.execution_parts();
 
         let silent = true;
-        let executor = sui_execution::executor(protocol_config, silent)
+        let executor = sui_execution::executor(protocol_config, silent, None)
             .expect("Creating an executor should not fail here");
 
         let expensive_checks = false;
@@ -1732,7 +1732,7 @@ impl AuthorityState {
             }
         };
 
-        let executor = sui_execution::executor(protocol_config, /* silent */ true)
+        let executor = sui_execution::executor(protocol_config, /* silent */ true, None)
             .expect("Creating an executor should not fail here");
         let intent_msg = IntentMessage::new(
             Intent {
@@ -1743,6 +1743,7 @@ impl AuthorityState {
             transaction,
         );
         let transaction_digest = TransactionDigest::new(default_hash(&intent_msg.value));
+
         let (inner_temp_store, effects, execution_result) = executor.dev_inspect_transaction(
             &self.database,
             protocol_config,
