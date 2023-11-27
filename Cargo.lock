@@ -13402,6 +13402,7 @@ dependencies = [
  "indicatif",
  "itertools",
  "move-core-types",
+ "move-vm-profiler",
  "narwhal-storage",
  "narwhal-types",
  "num_cpus",
