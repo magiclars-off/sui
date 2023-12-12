@@ -1189,7 +1189,11 @@ type MoveData =
   | { String:  string }
   | { Vector:  [MoveData] }
   | { Option:   MoveData? }
-  | { Struct:  [{ name: string, value: MoveData }] }
+  | { Struct:  [{ name: string , value: MoveData }] }
+  | { Variant: {
+      name: string,
+      fields: [{ name: string, value: MoveData }],
+  }
 """
 scalar MoveData
 
@@ -1544,6 +1548,14 @@ type MoveTypeLayout =
         fields: [{ name: string, layout: MoveTypeLayout }],
       }
     }
+  | { enum: [{
+          name: string,
+          layout: [{ 
+              name: string,
+              layout: MoveTypeLayout
+          }]
+      }] 
+  }
 """
 scalar MoveTypeLayout
 

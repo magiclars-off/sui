@@ -30,8 +30,8 @@ use move_vm_types::{
     gas::{GasMeter, SimpleInstruction},
     loaded_data::runtime_types::Type,
     values::{
-        self, IntegerValue, Locals, Reference, Struct, StructRef, VMValueCast, Value,
-        Vector, VectorRef,
+        self, IntegerValue, Locals, Reference, Struct, StructRef, VMValueCast, Value, Vector,
+        VectorRef,
     },
     views::TypeView,
 };
@@ -192,10 +192,9 @@ impl Interpreter {
             .map_err(|err| self.set_location(err))?;
         loop {
             let resolver = current_frame.resolver(link_context, loader);
-            let exit_code =
-                current_frame //self
-                    .execute_code(&resolver, &mut self, gas_meter)
-                    .map_err(|err| self.maybe_core_dump(err, &current_frame))?;
+            let exit_code = current_frame //self
+                .execute_code(&resolver, &mut self, gas_meter)
+                .map_err(|err| self.maybe_core_dump(err, &current_frame))?;
             match exit_code {
                 ExitCode::Return => {
                     let non_ref_vals = current_frame
@@ -245,13 +244,7 @@ impl Interpreter {
                         .map_err(|e| set_err_info!(current_frame, e))?;
 
                     if func.is_native() {
-                        self.call_native(
-                            &resolver,
-                            gas_meter,
-                            extensions,
-                            func,
-                            vec![],
-                        )?;
+                        self.call_native(&resolver, gas_meter, extensions, func, vec![])?;
                         current_frame.pc += 1; // advance past the Call instruction in the caller
                         profile_close_frame!(gas_meter, func_name);
 
@@ -342,7 +335,6 @@ impl Interpreter {
                     .vm_config()
                     .enable_invariant_violation_check_in_swap_loc,
             )?;
-
         }
         self.make_new_frame(func, ty_args, locals)
     }
@@ -374,29 +366,25 @@ impl Interpreter {
         ty_args: Vec<Type>,
     ) -> VMResult<()> {
         // Note: refactor if native functions push a frame on the stack
-        self.call_native_impl(
-            resolver,
-            gas_meter,
-            extensions,
-            function.clone(),
-            ty_args,
-        )
-        .map_err(|e| match function.module_id() {
-            Some(id) => {
-                let e = if resolver.loader().vm_config().error_execution_state {
-                    e.with_exec_state(self.get_internal_state())
-                } else {
-                    e
-                };
-                e.at_code_offset(function.index(), 0)
-                    .finish(Location::Module(id.clone()))
-            }
-            None => {
-                let err = PartialVMError::new(StatusCode::UNKNOWN_INVARIANT_VIOLATION_ERROR)
-                    .with_message("Unexpected native function not located in a module".to_owned());
-                self.set_location(err)
-            }
-        })
+        self.call_native_impl(resolver, gas_meter, extensions, function.clone(), ty_args)
+            .map_err(|e| match function.module_id() {
+                Some(id) => {
+                    let e = if resolver.loader().vm_config().error_execution_state {
+                        e.with_exec_state(self.get_internal_state())
+                    } else {
+                        e
+                    };
+                    e.at_code_offset(function.index(), 0)
+                        .finish(Location::Module(id.clone()))
+                }
+                None => {
+                    let err = PartialVMError::new(StatusCode::UNKNOWN_INVARIANT_VIOLATION_ERROR)
+                        .with_message(
+                            "Unexpected native function not located in a module".to_owned(),
+                        );
+                    self.set_location(err)
+                }
+            })
     }
 
     fn call_native_impl(
@@ -439,12 +427,8 @@ impl Interpreter {
             args.push_front(self.operand_stack.pop()?);
         }
 
-        let mut native_context = NativeContext::new(
-            self,
-            resolver,
-            extensions,
-            gas_meter.remaining_gas(),
-        );
+        let mut native_context =
+            NativeContext::new(self, resolver, extensions, gas_meter.remaining_gas());
         let native_function = function.get_native()?;
 
         gas_meter.charge_native_function_before_execution(
@@ -732,9 +716,7 @@ struct Stack {
 impl Stack {
     /// Create a new empty operand stack.
     fn new() -> Self {
-        Stack {
-            value: vec![],
-        }
+        Stack { value: vec![] }
     }
 
     /// Push a `Value` on the stack if the max stack size has not been reached. Abort execution
@@ -1315,6 +1297,15 @@ impl Frame {
                 gas_meter.charge_vec_swap(make_ty!(ty))?;
                 vec_ref.swap(idx1, idx2, ty)?;
             }
+            Bytecode::PackVariant(_)
+            | Bytecode::PackVariantGeneric(_)
+            | Bytecode::UnpackVariant(_)
+            | Bytecode::UnpackVariantGeneric(_)
+            | Bytecode::UnpackVariantImmRef(_)
+            | Bytecode::UnpackVariantMutRef(_)
+            | Bytecode::UnpackVariantGenericImmRef(_)
+            | Bytecode::UnpackVariantGenericMutRef(_)
+            | Bytecode::VariantSwitch(_) => unreachable!("enums not supported in V0"),
         }
 
         Ok(InstrRet::Ok)
@@ -1445,7 +1436,7 @@ impl Frame {
             Type::Reference(ty) | Type::MutableReference(ty) | Type::Vector(ty) => {
                 Self::check_depth_of_type_impl(resolver, ty, check_depth!(1), max_depth)?
             }
-            Type::Struct(si) => {
+            Type::Datatype(si) => {
                 let struct_type = resolver.loader().get_struct_type(*si).ok_or_else(|| {
                     PartialVMError::new(StatusCode::UNKNOWN_INVARIANT_VIOLATION_ERROR)
                         .with_message("Struct Definition not resolved".to_string())
@@ -1456,7 +1447,7 @@ impl Frame {
                     .ok_or_else(|| { PartialVMError::new(StatusCode::VM_MAX_VALUE_DEPTH_REACHED) })?
                     .solve(&[])?)
             }
-            Type::StructInstantiation(si, ty_args) => {
+            Type::DatatypeInstantiation(si, ty_args) => {
                 // Calculate depth of all type arguments, and make sure they themselves are not too deep.
                 let ty_arg_depths = ty_args
                     .iter()
