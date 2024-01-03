@@ -356,7 +356,7 @@ impl LocalExec {
                 use_authority,
                 executor_version,
                 protocol_version,
-                enable_profiler.clone(),
+                enable_profiler,
             )
             .await
             {
