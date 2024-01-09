@@ -11,6 +11,7 @@ use jsonrpsee::core::RpcResult;
 use jsonrpsee::http_client::HttpClient;
 use jsonrpsee::RpcModule;
 
+use std::net::SocketAddr;
 use sui_json_rpc::SuiRpcModule;
 use sui_json_rpc_api::WriteApiServer;
 use sui_json_rpc_types::{
@@ -40,6 +41,17 @@ impl WriteApiServer for WriteApiV2 {
         signatures: Vec<Base64>,
         options: Option<SuiTransactionBlockResponseOptions>,
         request_type: Option<ExecuteTransactionRequestType>,
+    ) -> RpcResult<SuiTransactionBlockResponse> {
+        unimplemented!()
+    }
+
+    async fn monitored_execute_transaction_block(
+        &self,
+        tx_bytes: Base64,
+        signatures: Vec<Base64>,
+        options: Option<SuiTransactionBlockResponseOptions>,
+        request_type: Option<ExecuteTransactionRequestType>,
+        client_addr: Option<SocketAddr>,
     ) -> RpcResult<SuiTransactionBlockResponse> {
         unimplemented!()
     }

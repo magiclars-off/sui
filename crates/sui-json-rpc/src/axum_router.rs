@@ -1,10 +1,10 @@
 // Copyright (c) Mysten Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-use std::sync::Arc;
+use core::panic;
+use std::{net::SocketAddr, sync::Arc};
 
-use axum::extract::Json;
-use axum::extract::State;
+use axum::extract::{ConnectInfo, Json, State};
 use futures::StreamExt;
 use hyper::HeaderMap;
 use jsonrpsee::core::server::helpers::BoundedSubscriptions;
@@ -16,7 +16,7 @@ use jsonrpsee::server::RandomIntegerIdProvider;
 use jsonrpsee::types::error::{ErrorCode, BATCHES_NOT_SUPPORTED_CODE, BATCHES_NOT_SUPPORTED_MSG};
 use jsonrpsee::types::{ErrorObject, Id, InvalidRequest, Params, Request};
 use jsonrpsee::{core::server::rpc_module::Methods, server::logger::Logger};
-use serde_json::value::RawValue;
+use serde_json::value::{RawValue, Value};
 
 use crate::routing_layer::RpcRouter;
 use sui_json_rpc_api::CLIENT_TARGET_API_VERSION_HEADER;
@@ -101,12 +101,13 @@ pub async fn json_rpc_handler<L: Logger>(
     State(service): State<JsonRpcService<L>>,
     headers: HeaderMap,
     Json(raw_request): Json<Box<RawValue>>,
+    ConnectInfo(client_addr): ConnectInfo<SocketAddr>,
 ) -> impl axum::response::IntoResponse {
     // Get version from header.
     let api_version = headers
         .get(CLIENT_TARGET_API_VERSION_HEADER)
         .and_then(|h| h.to_str().ok());
-    let response = process_raw_request(&service, api_version, raw_request.get()).await;
+    let response = process_raw_request(&service, api_version, raw_request.get(), client_addr).await;
 
     ok_response(response.result)
 }
@@ -115,9 +116,10 @@ async fn process_raw_request<L: Logger>(
     service: &JsonRpcService<L>,
     api_version: Option<&str>,
     raw_request: &str,
+    client_addr: SocketAddr,
 ) -> MethodResponse {
     if let Ok(request) = serde_json::from_str::<Request>(raw_request) {
-        process_request(request, api_version, service.call_data()).await
+        process_request(request, api_version, service.call_data(), client_addr).await
     } else if let Ok(_batch) = serde_json::from_str::<Vec<&RawValue>>(raw_request) {
         MethodResponse::error(
             Id::Null,
@@ -129,10 +131,40 @@ async fn process_raw_request<L: Logger>(
     }
 }
 
+fn apply_unconditional_redirects<'a>(
+    name: &str,
+    mut params: Params<'a>,
+    client_addr: SocketAddr,
+) -> (String, Params<'a>) {
+    // add client IP arg to the params, as this is a router redirect
+    // from `execute_transaction_block`, which does require the client IP
+    match name {
+        "executeTransactionBlock" => {
+            let mut params_vec: Vec<Value> =
+                params.parse().expect("Failed to parse jsonrpsee params");
+            let new_param = Value::String(client_addr.to_string());
+            params_vec.push(new_param);
+            let params_str = serde_json::to_string(&params_vec)
+                .expect("Failed to deserialized params json to string");
+            Ok((
+                String::from("monitoredExecuteTransactionBlock"),
+                Params::new(Some(params_str.as_str())),
+            ))
+        }
+        "monitoredExecuteTransactionBlock" => {
+            // TODO(william) how can we enforce this? If we do not, we risk an attacker
+            // calling it directly with a different client IP in order to bypass monitoring
+            panic!("monitoredExecuteTransactionBlock should not be called externally");
+        }
+        _ => Ok((String::from(name), params)),
+    }
+}
+
 async fn process_request<L: Logger>(
     req: Request<'_>,
     api_version: Option<&str>,
     call: CallData<'_, L>,
+    client_addr: SocketAddr,
 ) -> MethodResponse {
     let CallData {
         methods,
@@ -143,8 +175,13 @@ async fn process_request<L: Logger>(
     } = call;
     let conn_id = 0; // unused
 
-    let params = Params::new(req.params.map(|params| params.get()));
+    let mut params = Params::new(req.params.map(|params| params.get()));
     let name = rpc_router.route(&req.method, api_version);
+    // This is really ugly, but it's the only way to do it for now. We will
+    // kill this aggressively once we move away from this json rpc framework
+    let (name, params) = apply_unconditional_redirects(name, params, client_addr);
+    let name = name.as_str();
+
     let id = req.id;
 
     let response = match methods.method_with_name(name) {
@@ -177,7 +214,6 @@ async fn process_request<L: Logger>(
 
                 let id = id.into_owned();
                 let params = params.into_owned();
-
                 (callback)(id, params, conn_id, max_response_body_size as usize, None).await
             }
             MethodKind::Subscription(_) | MethodKind::Unsubscription(_) => {
