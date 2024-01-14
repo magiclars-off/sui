@@ -105,6 +105,7 @@ const MAX_PROTOCOL_VERSION: u64 = 35;
 // Version 34: Framework changes for random beacon.
 // Version 35: Add poseidon hash function.
 //             Enable coin deny list.
+//             Enable group operations native functions in devnet.
 
 #[derive(Copy, Clone, Debug, Hash, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
 pub struct ProtocolVersion(u64);
@@ -376,6 +377,10 @@ struct FeatureFlags {
     // If true, enable the coin deny list.
     #[serde(skip_serializing_if = "is_false")]
     enable_coin_deny_list: bool,
+
+    // Enable native functions for group operations.
+    #[serde(skip_serializing_if = "is_false")]
+    enable_group_ops_native_functions: bool,
 }
 
 fn is_false(b: &bool) -> bool {
@@ -1102,6 +1107,10 @@ impl ProtocolConfig {
     pub fn enable_coin_deny_list(&self) -> bool {
         self.feature_flags.enable_coin_deny_list
     }
+
+    pub fn enable_group_ops_native_functions(&self) -> bool {
+        self.feature_flags.enable_group_ops_native_functions
+    }
 }
 
 #[cfg(not(msim))]
@@ -1758,6 +1767,11 @@ impl ProtocolConfig {
                     }
 
                     cfg.feature_flags.enable_coin_deny_list = true;
+
+                    // Only enable group ops on devnet
+                    if chain != Chain::Mainnet && chain != Chain::Testnet {
+                        cfg.feature_flags.enable_group_ops_native_functions = true;
+                    }
                 }
                 // Use this template when making changes:
                 //
