@@ -940,7 +940,7 @@ impl PgManager {
     ) -> Result<Option<Address>, Error> {
         let domain = name.parse::<Domain>()?;
 
-        let record_id = name_service_config.record_field_id(&domain, None);
+        let record_id = name_service_config.record_field_id(&domain);
 
         let field_record_object = match self.inner.get_object_in_blocking_task(record_id).await? {
             Some(o) => o,
