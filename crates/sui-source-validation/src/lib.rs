@@ -86,8 +86,8 @@ pub enum SourceVerificationError {
         module: Symbol,
     },
 
-    #[error("Cannot check local module for {module}: {message}")]
-    CannotCheckLocalModules { module: Symbol, message: String },
+    #[error("Cannot check local module for {package}: {message}")]
+    CannotCheckLocalModules { package: Symbol, message: String },
 
     #[error("On-chain address cannot be zero")]
     ZeroOnChainAddresSpecifiedFailure,
@@ -365,7 +365,7 @@ fn local_modules(
         // Compile dependencies with prior compilers if needed.
         let deps_compiled_units = units_for_toolchain(&compiled_package.deps_compiled_units)
             .map_err(|e| SourceVerificationError::CannotCheckLocalModules {
-                module: compiled_package.compiled_package_info.package_name,
+                package: compiled_package.compiled_package_info.package_name,
                 message: e.to_string(),
             })?;
 
@@ -397,7 +397,7 @@ fn local_modules(
 
                 units_for_toolchain(&root_compiled_units).map_err(|e| {
                     SourceVerificationError::CannotCheckLocalModules {
-                        module: compiled_package.compiled_package_info.package_name,
+                        package: compiled_package.compiled_package_info.package_name,
                         message: e.to_string(),
                     }
                 })?
@@ -432,7 +432,7 @@ fn local_modules(
 
                 units_for_toolchain(&root_compiled_units).map_err(|e| {
                     SourceVerificationError::CannotCheckLocalModules {
-                        module: compiled_package.compiled_package_info.package_name,
+                        package: compiled_package.compiled_package_info.package_name,
                         message: e.to_string(),
                     }
                 })?
