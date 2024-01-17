@@ -47,8 +47,9 @@ use sui_types::base_types::ObjectID;
 mod tests;
 
 const CURRENT_COMPILER_VERSION: &str = env!("CARGO_PKG_VERSION");
-const LEGACY_COMPILER_VERSION: &str = CURRENT_COMPILER_VERSION; /* TODO: update this when Move 2024 is released */
-const LEGACY_MOVE_LOCK_VERSION: u64 = 0;
+const LEGACY_COMPILER_VERSION: &str = CURRENT_COMPILER_VERSION; // TODO: update this when Move 2024 is released
+const PRE_TOOLCHAIN_MOVE_LOCK_VERSION: u64 = 0; // Used to detect lockfiles pre-toolchain versioning support
+const CANONICAL_BINARY_NAME: &str = "sui";
 
 #[derive(Debug, Error)]
 pub enum SourceVerificationError {
@@ -518,7 +519,7 @@ fn units_for_toolchain(
 
         let mut lock_file = File::open(lock_file)?;
         let lock_version = Header::read(&mut lock_file)?.version;
-        if lock_version == LEGACY_MOVE_LOCK_VERSION {
+        if lock_version == PRE_TOOLCHAIN_MOVE_LOCK_VERSION {
             // No need to attempt reading lock file toolchain
             debug!("{package} on legacy compiler",);
             package_version_map.insert(*package, (legacy_toolchain(), vec![local_unit.clone()]));
@@ -630,6 +631,9 @@ fn download_and_compile(
             .map_err(|e| anyhow!("failed to untar compiler binary: {e}"))?;
 
         set_executable_permission(dest_binary_os)?;
+        let mut dest_canonical_binary = dest_version.clone();
+        dest_canonical_binary.extend(["target", "release", CANONICAL_BINARY_NAME]);
+        std::fs::rename(dest_binary_os, dest_canonical_binary)?;
     }
 
     debug!(
