@@ -11225,7 +11225,6 @@ dependencies = [
  "shared-crypto",
  "shell-words",
  "signature 1.6.4",
- "sui",
  "sui-config",
  "sui-execution",
  "sui-genesis-builder",
