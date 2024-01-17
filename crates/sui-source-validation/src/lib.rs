@@ -593,12 +593,11 @@ fn download_and_compile(
     }: &ToolchainVersion,
     dep_name: &Symbol,
 ) -> anyhow::Result<()> {
-    let binaries_path = &*MOVE_HOME; // E.g., ~/.move/binaries
-    let mut dest_dir = PathBuf::from(binaries_path);
-    dest_dir = dest_dir.join("binaries");
-    let dest_version = dest_dir.join(compiler_version.clone());
+    let dest_dir = PathBuf::from_iter([&*MOVE_HOME, "binaries"]); // E.g., ~/.move/binaries
+    let dest_version = dest_dir.join(&compiler_version);
     let platform = detect_platform()?;
-    let dest_binary = dest_version.join(format!("target/release/sui-{}", platform));
+    let mut dest_binary = dest_version.clone();
+    dest_binary.extend(["target", "release", &format!("sui-{platform}")]);
     let dest_binary_os = OsStr::new(dest_binary.as_path());
 
     if !dest_binary.exists() {
