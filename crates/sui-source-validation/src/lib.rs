@@ -14,7 +14,6 @@ use move_package::compilation::package_layout::CompiledPackageLayout;
 use move_package::lock_file::schema::{Header, ToolchainVersion};
 use move_package::source_package::layout::SourcePackageLayout;
 use move_package::source_package::parsed_manifest::{FileName, PackageName};
-use std::collections::HashSet;
 use std::ffi::OsStr;
 use std::fs::File;
 use std::io::{self, Seek};
@@ -467,6 +466,22 @@ fn local_modules(
     Ok(map)
 }
 
+fn current_toolchain() -> ToolchainVersion {
+    ToolchainVersion {
+        compiler_version: CURRENT_COMPILER_VERSION.into(),
+        edition: Edition::LEGACY, /* does not matter, unused for current_toolchain */
+        flavor: Flavor::Sui,      /* does not matter, unused for current_toolchain */
+    }
+}
+
+fn legacy_toolchain() -> ToolchainVersion {
+    ToolchainVersion {
+        compiler_version: LEGACY_COMPILER_VERSION.into(),
+        edition: Edition::LEGACY,
+        flavor: Flavor::Sui,
+    }
+}
+
 /// Ensures `compiled_units` are compiled with the right compiler version, based on
 /// Move.lock contents. This works by detecting if a compiled unit requires a prior compiler version:
 /// - If so, download the compiler, recompile the unit, and return that unit in the result.
@@ -477,21 +492,19 @@ fn units_for_toolchain(
     if std::env::var("VERIFIED_SOURCE_BUILD").is_err() {
         return Ok(compiled_units.clone());
     }
-    let mut package_version_map: HashMap<Symbol, ToolchainVersion> = HashMap::new();
+    let mut package_version_map: HashMap<Symbol, (ToolchainVersion, Vec<CompiledUnitWithSource>)> =
+        HashMap::new();
     // First iterate over packages, mapping the required version for each package in `package_version_map`.
     for (package, local_unit) in compiled_units {
-        if package_version_map.contains_key(package) {
+        if let Some((_, units)) = package_version_map.get_mut(package) {
+            // We've processed this package's required version.
+            units.push(local_unit.clone());
             continue;
         }
-        let current_toolchain = ToolchainVersion {
-            compiler_version: CURRENT_COMPILER_VERSION.into(),
-            edition: Edition::LEGACY, /* does not matter, unused for current_toolchain */
-            flavor: Flavor::Sui,      /* does not matter, unused for current_toolchain */
-        };
 
         if sui_types::is_system_package(local_unit.unit.address.into_inner()) {
             // System packages are always compiled with the current compiler.
-            package_version_map.insert(*package, current_toolchain);
+            package_version_map.insert(*package, (current_toolchain(), vec![local_unit.clone()]));
             continue;
         }
 
@@ -499,7 +512,7 @@ fn units_for_toolchain(
         let lock_file = package_root.join("Move.lock");
         if !lock_file.exists() {
             // No lock file implies current compiler for this package.
-            package_version_map.insert(*package, current_toolchain);
+            package_version_map.insert(*package, (current_toolchain(), vec![local_unit.clone()]));
             continue;
         }
 
@@ -511,24 +524,22 @@ fn units_for_toolchain(
             // No ToolchainVersion and old Move.lock version implies legacy compiler.
             None if lock_version == LEGACY_MOVE_LOCK_VERSION => {
                 debug!("{package} on legacy compiler",);
-                let legacy_toolchain = ToolchainVersion {
-                    compiler_version: LEGACY_COMPILER_VERSION.into(),
-                    edition: Edition::LEGACY,
-                    flavor: Flavor::Sui,
-                };
-                package_version_map.insert(*package, legacy_toolchain);
+                package_version_map
+                    .insert(*package, (legacy_toolchain(), vec![local_unit.clone()]));
             }
             // No ToolchainVersion and new Move.lock version implies current compiler.
             None => {
                 debug!("{package} on current compiler @ {CURRENT_COMPILER_VERSION}",);
-                package_version_map.insert(*package, current_toolchain);
+                package_version_map
+                    .insert(*package, (current_toolchain(), vec![local_unit.clone()]));
             }
             // This dependency uses the current compiler.
             Some(ToolchainVersion {
                 compiler_version, ..
             }) if compiler_version == CURRENT_COMPILER_VERSION => {
                 debug!("{package} on current compiler @ {CURRENT_COMPILER_VERSION}",);
-                package_version_map.insert(*package, current_toolchain);
+                package_version_map
+                    .insert(*package, (current_toolchain(), vec![local_unit.clone()]));
             }
             // This dependency needs a prior compiler. Mark it and compile.
             Some(toolchain_version) => {
@@ -537,48 +548,36 @@ fn units_for_toolchain(
                     "REQUIRE".bold().green(),
                     toolchain_version.compiler_version.yellow(),
                 );
-                package_version_map.insert(*package, toolchain_version);
+                package_version_map.insert(*package, (toolchain_version, vec![local_unit.clone()]));
             }
         }
     }
 
     let mut units = vec![];
-    let mut package_compiled: HashSet<Symbol> = HashSet::new();
-    // Iterate over compiled units, and determine whether they need to be recompiled and replaced by a prior compiler.
-    for (package, local_unit) in compiled_units {
-        match package_version_map.get(package) {
-            Some(ToolchainVersion {
-                compiler_version, ..
-            }) if compiler_version == CURRENT_COMPILER_VERSION => {
-                units.push((*package, local_unit.clone()));
-                continue;
-            }
-            Some(toolchain_version) if !package_compiled.contains(package) => {
-                let package_root = SourcePackageLayout::try_find_root(&local_unit.source_path)?;
-                download_and_compile(package_root.clone(), toolchain_version, package)?;
-                package_compiled.insert(*package);
+    // Iterate over compiled units, and check if they need to be recompiled and replaced by a prior compiler's output.
+    for (package, (toolchain_version, local_units)) in package_version_map {
+        if toolchain_version.compiler_version == CURRENT_COMPILER_VERSION {
+            let local_units: Vec<_> = local_units.iter().map(|u| (package, u.clone())).collect();
+            units.extend(local_units);
+            continue;
+        }
 
-                let compiled_unit_paths = vec![package_root.clone()];
-                let compiled_units = find_filenames(&compiled_unit_paths, |path| {
-                    extension_equals(path, MOVE_COMPILED_EXTENSION)
-                })?;
-                let build_path = package_root.clone().join("build").join(package.as_str());
-                // If we compiled units with a previous compiler, add *all* those units at once, so that
-                // we don't need to resolve them by path one-by-one.
-                for bytecode_path in compiled_units {
-                    info!("bytecode path {bytecode_path}, {package}");
-                    let local_unit =
-                        decode_bytecode_file(build_path.clone(), package, &bytecode_path)?;
-                    units.push((*package, local_unit))
-                }
-                continue;
-            }
-            Some(_) => {
-                // If a toolchain version for a previous compiler exists, we
-                // already added all compiled units to deps_compiled_units.
-                continue;
-            }
-            None => bail!("Expected a version for {package} but none found"),
+        if local_units.is_empty() {
+            bail!("Expected one or more modules, but none found");
+        }
+        let package_root = SourcePackageLayout::try_find_root(&local_units[0].source_path)?;
+        download_and_compile(package_root.clone(), &toolchain_version, &package)?;
+
+        let compiled_unit_paths = vec![package_root.clone()];
+        let compiled_units = find_filenames(&compiled_unit_paths, |path| {
+            extension_equals(path, MOVE_COMPILED_EXTENSION)
+        })?;
+        let build_path = package_root.clone().join("build").join(package.as_str());
+        // Add all units compiled with the previous compiler.
+        for bytecode_path in compiled_units {
+            info!("bytecode path {bytecode_path}, {package}");
+            let local_unit = decode_bytecode_file(build_path.clone(), &package, &bytecode_path)?;
+            units.push((package, local_unit))
         }
     }
     Ok(units)
