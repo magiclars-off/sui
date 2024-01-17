@@ -595,7 +595,7 @@ fn download_and_compile(
     dep_name: &Symbol,
 ) -> anyhow::Result<()> {
     let dest_dir = PathBuf::from_iter([&*MOVE_HOME, "binaries"]); // E.g., ~/.move/binaries
-    let dest_version = dest_dir.join(&compiler_version);
+    let dest_version = dest_dir.join(compiler_version);
     let platform = detect_platform()?;
     let mut dest_binary = dest_version.clone();
     dest_binary.extend(["target", "release", &format!("sui-{platform}")]);
