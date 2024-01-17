@@ -363,15 +363,11 @@ fn local_modules(
 
     if include_deps {
         // Compile dependencies with prior compilers if needed.
-        let deps_compiled_units = match units_for_toolchain(&compiled_package.deps_compiled_units) {
-            Ok(result) => result,
-            Err(e) => {
-                return Err(SourceVerificationError::CannotCheckLocalModules {
-                    module: compiled_package.compiled_package_info.package_name,
-                    message: e.to_string(),
-                })
-            }
-        };
+        let deps_compiled_units = units_for_toolchain(&compiled_package.deps_compiled_units)
+            .map_err(|e| SourceVerificationError::CannotCheckLocalModules {
+                module: compiled_package.compiled_package_info.package_name,
+                message: e.to_string(),
+            })?;
 
         for (package, local_unit) in deps_compiled_units {
             let m = &local_unit.unit;
@@ -398,15 +394,13 @@ fn local_modules(
                     .iter()
                     .map(|u| ("root".into(), u.clone()))
                     .collect::<Vec<_>>();
-                match units_for_toolchain(&root_compiled_units) {
-                    Ok(result) => result,
-                    Err(e) => {
-                        return Err(SourceVerificationError::CannotCheckLocalModules {
-                            module: compiled_package.compiled_package_info.package_name,
-                            message: e.to_string(),
-                        })
+
+                units_for_toolchain(&root_compiled_units).map_err(|e| {
+                    SourceVerificationError::CannotCheckLocalModules {
+                        module: compiled_package.compiled_package_info.package_name,
+                        message: e.to_string(),
                     }
-                }
+                })?
             };
 
             for (_, local_unit) in root_compiled_units {
@@ -435,15 +429,13 @@ fn local_modules(
                     .iter()
                     .map(|u| ("root".into(), u.clone()))
                     .collect::<Vec<_>>();
-                match units_for_toolchain(&root_compiled_units) {
-                    Ok(result) => result,
-                    Err(e) => {
-                        return Err(SourceVerificationError::CannotCheckLocalModules {
-                            module: compiled_package.compiled_package_info.package_name,
-                            message: e.to_string(),
-                        })
+
+                units_for_toolchain(&root_compiled_units).map_err(|e| {
+                    SourceVerificationError::CannotCheckLocalModules {
+                        module: compiled_package.compiled_package_info.package_name,
+                        message: e.to_string(),
                     }
-                }
+                })?
             };
 
             for (_, local_unit) in root_compiled_units {
