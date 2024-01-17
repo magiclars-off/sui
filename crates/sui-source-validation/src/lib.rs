@@ -517,16 +517,18 @@ fn units_for_toolchain(
         }
 
         let mut lock_file = File::open(lock_file)?;
-        let toolchain_version = ToolchainVersion::read(&mut lock_file)?;
-        lock_file.rewind()?;
         let lock_version = Header::read(&mut lock_file)?.version;
+        if lock_version == LEGACY_MOVE_LOCK_VERSION {
+            // No need to attempt reading lock file toolchain
+            debug!("{package} on legacy compiler",);
+            package_version_map.insert(*package, (legacy_toolchain(), vec![local_unit.clone()]));
+            continue;
+        }
+
+        // Read lock file toolchain info
+        lock_file.rewind()?;
+        let toolchain_version = ToolchainVersion::read(&mut lock_file)?;
         match toolchain_version {
-            // No ToolchainVersion and old Move.lock version implies legacy compiler.
-            None if lock_version == LEGACY_MOVE_LOCK_VERSION => {
-                debug!("{package} on legacy compiler",);
-                package_version_map
-                    .insert(*package, (legacy_toolchain(), vec![local_unit.clone()]));
-            }
             // No ToolchainVersion and new Move.lock version implies current compiler.
             None => {
                 debug!("{package} on current compiler @ {CURRENT_COMPILER_VERSION}",);
