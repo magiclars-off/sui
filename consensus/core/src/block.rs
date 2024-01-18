@@ -10,10 +10,14 @@ use std::{
 };
 
 use bytes::Bytes;
-use consensus_config::{AuthorityIndex, DefaultHashFunction, DIGEST_LENGTH};
+use consensus_config::{AuthorityIndex, DefaultHashFunction, Epoch, DIGEST_LENGTH};
 use enum_dispatch::enum_dispatch;
 use fastcrypto::hash::{Digest, HashFunction};
 use serde::{Deserialize, Serialize};
+
+use crate::context::Context;
+
+const GENESIS_ROUND: Round = 0;
 
 /// Round number of a block.
 pub type Round = u32;
@@ -60,6 +64,26 @@ pub enum Block {
     V1(BlockV1),
 }
 
+impl Block {
+    /// Generate the genesis blocks for the latest Block version. The tuple contains (my_genesis_block, others_genesis_blocks).
+    /// The blocks are returned in authority index order.
+    pub(crate) fn genesis(context: Arc<Context>) -> (VerifiedBlock, Vec<VerifiedBlock>) {
+        let (my_block, others_block): (Vec<_>, Vec<_>) = context
+            .committee
+            .authorities()
+            .map(|(authority_index, _)| {
+                let signed = SignedBlock::new(Block::V1(BlockV1::genesis(
+                    authority_index,
+                    context.committee.epoch(),
+                )));
+                VerifiedBlock::new_verified_unserialized(signed)
+                    .expect("Shouldn't fail when creating verified block for genesis")
+            })
+            .partition(|block| block.author() == context.own_index);
+        (my_block[0].clone(), others_block)
+    }
+}
+
 #[enum_dispatch]
 pub trait BlockAPI {
     fn round(&self) -> Round;
@@ -67,6 +91,7 @@ pub trait BlockAPI {
     fn timestamp_ms(&self) -> BlockTimestampMs;
     fn ancestors(&self) -> &[BlockRef];
     fn payload(&self) -> &[Transaction];
+    fn epoch(&self) -> Epoch;
 }
 
 #[derive(Clone, Default, Deserialize, Serialize)]
@@ -77,6 +102,7 @@ pub struct BlockV1 {
     timestamp_ms: BlockTimestampMs,
     ancestors: Vec<BlockRef>,
     payload: Vec<Transaction>,
+    epoch: Epoch,
 }
 
 impl BlockV1 {
@@ -87,6 +113,7 @@ impl BlockV1 {
         timestamp_ms: BlockTimestampMs,
         ancestors: Vec<BlockRef>,
         payload: Vec<Transaction>,
+        epoch: Epoch,
     ) -> BlockV1 {
         Self {
             round,
@@ -94,6 +121,19 @@ impl BlockV1 {
             timestamp_ms,
             ancestors,
             payload,
+            epoch,
+        }
+    }
+
+    /// Generate the block that is meant to be used for genesis
+    pub(crate) fn genesis(author: AuthorityIndex, epoch: Epoch) -> BlockV1 {
+        Self {
+            round: GENESIS_ROUND,
+            author,
+            timestamp_ms: 0,
+            ancestors: vec![],
+            payload: vec![],
+            epoch,
         }
     }
 }
@@ -117,6 +157,10 @@ impl BlockAPI for BlockV1 {
 
     fn payload(&self) -> &[Transaction] {
         &self.payload
+    }
+
+    fn epoch(&self) -> Epoch {
+        self.epoch
     }
 }
 
@@ -409,6 +453,11 @@ impl TestBlock {
 
     pub(crate) fn set_ancestors(mut self, ancestors: Vec<BlockRef>) -> Self {
         self.block.ancestors = ancestors;
+        self
+    }
+
+    pub(crate) fn set_epoch(mut self, epoch: Epoch) -> Self {
+        self.block.epoch = epoch;
         self
     }
 
