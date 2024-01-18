@@ -597,12 +597,12 @@ fn download_and_compile(
 ) -> anyhow::Result<()> {
     let dest_dir = PathBuf::from_iter([&*MOVE_HOME, "binaries"]); // E.g., ~/.move/binaries
     let dest_version = dest_dir.join(compiler_version);
-    let platform = detect_platform()?;
-    let mut dest_binary = dest_version.clone();
-    dest_binary.extend(["target", "release", &format!("sui-{platform}")]);
-    let dest_binary_os = OsStr::new(dest_binary.as_path());
+    let mut dest_canonical_binary = dest_version.clone();
+    dest_canonical_binary.extend(["target", "release", CANONICAL_BINARY_NAME]);
 
-    if !dest_binary.exists() {
+    if !dest_canonical_binary.exists() {
+        // Check the platform and proceed if we can download a binary. If not, the user should follow error instructions to sideload the binary.
+        let platform = detect_platform(&root, compiler_version, &dest_canonical_binary)?;
         // Download if binary does not exist.
         let url = format!("https://github.com/MystenLabs/sui/releases/download/mainnet-v{}/sui-mainnet-v{}-{}.tgz", compiler_version, compiler_version, platform);
 
@@ -630,14 +630,16 @@ fn download_and_compile(
             .unpack(&dest_version)
             .map_err(|e| anyhow!("failed to untar compiler binary: {e}"))?;
 
+        let mut dest_binary = dest_version.clone();
+        dest_binary.extend(["target", "release", &format!("sui-{platform}")]);
+        let dest_binary_os = OsStr::new(dest_binary.as_path());
         set_executable_permission(dest_binary_os)?;
-        let mut dest_canonical_binary = dest_version.clone();
-        dest_canonical_binary.extend(["target", "release", CANONICAL_BINARY_NAME]);
-        std::fs::rename(dest_binary_os, dest_canonical_binary)?;
+        std::fs::rename(dest_binary_os, dest_canonical_binary.clone())?;
     }
 
     debug!(
-        "sui move build --default-move-edition {} --default-move-flavor {} -p {}",
+        "{} move build --default-move-edition {} --default-move-flavor {} -p {}",
+        dest_canonical_binary.display(),
         edition.to_string().as_str(),
         flavor.to_string().as_str(),
         root.display()
@@ -648,7 +650,7 @@ fn download_and_compile(
         dep_name.as_str(),
         compiler_version.yellow()
     );
-    Command::new(dest_binary_os)
+    Command::new(dest_canonical_binary)
         .args([
             OsStr::new("move"),
             OsStr::new("build"),
@@ -666,13 +668,25 @@ fn download_and_compile(
     Ok(())
 }
 
-fn detect_platform() -> anyhow::Result<String> {
+fn detect_platform(
+    package_path: &Path,
+    compiler_version: &String,
+    dest_dir: &Path,
+) -> anyhow::Result<String> {
     let s = match (std::env::consts::OS, std::env::consts::ARCH) {
         ("macos", "aarch64") => "macos-arm64",
         ("macos", "x86_64") => "macos-x86_64",
         ("linux", "x86_64") => "ubuntu-x86_64",
         ("windows", "x86_64") => "windows-x86_64",
-        (os, arch) => bail!("unsupported os {os} and arch {arch}"),
+        (os, arch) => bail!(
+	    "The package {} needs to be built with sui compiler version {compiler_version} but there \
+	     is no binary release available to download for your platform:\n\
+	     Operating System: {os}\n\
+	     Architecture: {arch}\n\
+	     You can manually put a `sui` binary for your platform in {} and rerun your command to continue.",
+	    package_path.display(),
+	    dest_dir.display(),
+	),
     };
     Ok(s.into())
 }
