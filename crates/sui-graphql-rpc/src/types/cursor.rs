@@ -243,7 +243,6 @@ impl<C: CursorType + Eq + Clone + Send + Sync + 'static> Page<C> {
         Ok(self.paginate_results(results))
     }
 
-    // TODO (wlmyng) tbh shouldn't be toooo hard to extend this if given a raw sql string
     pub(crate) fn paginate_raw_query<T, Q>(
         &self,
         conn: &mut Conn<'_>,
@@ -255,6 +254,9 @@ impl<C: CursorType + Eq + Clone + Send + Sync + 'static> Page<C> {
     {
         let mut query = query();
 
+        // TODO (wlmyng) handling the WHERE is not straightforward
+        // perhaps we can have a RawSqlStruct { string, has_where }
+
         if let Some(after) = self.after() {
             query = <T as RawTarget<C>>::filter_ge(after, &query);
         }
@@ -265,7 +267,9 @@ impl<C: CursorType + Eq + Clone + Send + Sync + 'static> Page<C> {
 
         query = <T as RawTarget<C>>::order(self.is_from_front(), &query);
 
-        let limit = format!("LIMIT {};", self.limit() as i64 + 2);
+        query = format!("{} LIMIT {};", query, self.limit() as i64 + 2);
+
+        println!("query: {}", query);
 
         let results: Vec<T> = if self.limit() == 0 {
             // Avoid the database roundtrip in the degenerate case.

@@ -145,7 +145,7 @@ impl Owner {
             return Ok(Connection::new(false, false));
         };
 
-        Object::paginate_historical(ctx.data_unchecked(), page, None, None, filter)
+        Object::paginate_historical_v2(ctx.data_unchecked(), page, None, None, filter)
             .await
             .extend()
     }

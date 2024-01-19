@@ -341,7 +341,7 @@ impl Object {
             return Ok(Connection::new(false, false));
         };
 
-        Object::paginate_historical(ctx.data_unchecked(), page, None, None, filter)
+        Object::paginate_historical_v2(ctx.data_unchecked(), page, None, None, filter)
             .await
             .extend()
     }
@@ -653,7 +653,7 @@ impl Object {
                 }
 
                 if let Some(type_) = &filter.type_ {
-                    // TODO (wlmyng)
+                    // TODO (wlmyng) TypeFilter
                     // filters.push_str(" AND object_type IS NOT NULL");
                     // query = query.filter(dsl::object_type.is_not_null());
                     // query = type_.apply(query, dsl::object_type.assume_not_null());
@@ -818,8 +818,6 @@ impl Object {
                 FROM unioned_data u
                 INNER JOIN latest_versions lv ON u.object_id = lv.object_id AND u.object_version = lv.max_version
                 {}", snapshot_query, history_query, filters_string);
-
-                println!("{}", raw_sql);
 
                 raw_sql
             })
@@ -1140,6 +1138,7 @@ impl Target<Cursor> for StoredHistoryObject {
 
 impl RawTarget<Cursor> for StoredHistoryObject {
     fn filter_ge(cursor: &Cursor, query: &str) -> String {
+        // todo (wlmyng) WHERE if no WHERE, else AND
         format!(
             "{} AND object_id > '\\x{}'::bytea",
             query,
@@ -1148,6 +1147,7 @@ impl RawTarget<Cursor> for StoredHistoryObject {
     }
 
     fn filter_le(cursor: &Cursor, query: &str) -> String {
+        // todo (wlmyng) WHERE if no WHERE, else AND
         format!(
             "{} AND object_id < '\\x{}'::bytea",
             query,
