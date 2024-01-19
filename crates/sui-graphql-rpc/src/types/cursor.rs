@@ -250,7 +250,7 @@ impl<C: CursorType + Eq + Clone + Send + Sync + 'static> Page<C> {
     ) -> QueryResult<(bool, bool, impl Iterator<Item = T>)>
     where
         Q: Fn() -> String,
-        T: Send + RawTarget<C> + Target<C> + FromSqlRow<Untyped, DieselBackend> + 'static, // TODO clean this up since we just need T::cursor
+        T: Send + RawTarget<C> + Target<C> + FromSqlRow<Untyped, DieselBackend> + 'static, // TODO (wlmyng) clean this up since we just need T::cursor
     {
         let mut query = query();
 
