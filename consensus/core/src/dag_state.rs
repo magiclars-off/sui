@@ -7,7 +7,7 @@ use std::{
 };
 
 use crate::{
-    block::{BlockRef, Round, Slot, VerifiedBlock},
+    block::{BlockAPI, BlockRef, Round, Slot, VerifiedBlock},
     commit::Commit,
     context::Context,
     storage::Store,
@@ -79,8 +79,27 @@ impl DagState {
     /// Accepts a block into DagState and keeps it in memory.
     pub(crate) fn accept_block(&mut self, block: VerifiedBlock) {
         let block_ref = block.reference();
+        // Ensure we don't write multiple blocks per slot for our own index
+        if block_ref.author == self.context.own_index {
+            let existing_blocks = self.get_blocks_at_slot(Slot::from(block_ref));
+            if !existing_blocks.is_empty() {
+                // TODO: should we panic?
+                tracing::error!(
+                    "Block Rejected! Attempted to add block {block} to own slot where block(s) {existing_blocks:#?} already exists."
+                );
+                return;
+            }
+        }
         self.recent_blocks.insert(block_ref, block);
         self.cached_refs[block_ref.author].insert(block_ref);
+    }
+
+    /// Accepts a blocks into DagState and keeps it in memory.
+    #[cfg(test)]
+    pub(crate) fn accept_blocks(&mut self, blocks: Vec<VerifiedBlock>) {
+        for block in blocks {
+            self.accept_block(block);
+        }
     }
 
     /// Gets a copy of an uncommitted block. Returns None if not found.
@@ -89,20 +108,43 @@ impl DagState {
         self.recent_blocks.get(reference).cloned()
     }
 
-    pub(crate) fn get_blocks_at_slot(&self, _slot: Slot) -> Vec<VerifiedBlock> {
-        unimplemented!()
+    pub(crate) fn get_blocks_at_slot(&self, slot: Slot) -> Vec<VerifiedBlock> {
+        self.recent_blocks
+            .iter()
+            .filter(|(block_ref, _)| Slot::from(**block_ref) == slot)
+            .map(|(_, verified_block)| verified_block.clone())
+            .collect()
     }
 
     pub(crate) fn linked_to_round(
         &self,
-        _later_block: &VerifiedBlock,
-        _earlier_round: Round,
+        initial_block: &VerifiedBlock,
+        target_round: Round,
     ) -> Vec<VerifiedBlock> {
-        unimplemented!()
+        let mut ancestors = vec![initial_block.clone()];
+        for r in (target_round..initial_block.round()).rev() {
+            ancestors = self
+                .get_blocks_by_round(r)
+                .into_iter()
+                .filter(|block| {
+                    ancestors
+                        .iter()
+                        .any(|x| x.ancestors().contains(&block.reference()))
+                })
+                .collect();
+            if ancestors.is_empty() {
+                break;
+            }
+        }
+        ancestors
     }
 
-    pub(crate) fn get_blocks_by_round(&self, _round: Round) -> Vec<VerifiedBlock> {
-        unimplemented!()
+    pub(crate) fn get_blocks_by_round(&self, round: Round) -> Vec<VerifiedBlock> {
+        self.recent_blocks
+            .iter()
+            .filter(|(block_ref, _)| block_ref.round == round)
+            .map(|(_, verified_block)| verified_block.clone())
+            .collect()
     }
 }
 
