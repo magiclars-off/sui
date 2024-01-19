@@ -249,17 +249,38 @@ impl From<Object> for ObjectEntry {
 pub struct InMemoryCache {
     // Objects are not cached using an LRU because we manage cache evictions manually due to sui
     // semantics.
+    //
+    // The main consistency rule is that there cannot be a more recent version of the object in
+    // the db than the most recent one in the cache.  This is because all writes go through the
+    // cache, and we evict older versions first.
+    //
+    // Data in this table may be either dirty or clean (committed to db). It is dirty after a
+    // transaction has been executed but before it has been committed to the db. After data has
+    // been committed to the db, the object may or may not be evicted. Dead objects are always
+    // evicted as soon as possible. Live objects may remain in the cache in a non-dirty state
+    // if we expect them to be read again soon. Or they can be evicted in order to manage the size
+    // of the cache.
     objects: DashMap<ObjectID, BTreeMap<SequenceNumber, ObjectEntry>>,
 
-    // packages are cache separately from objects because they are immutable and can be used by any
-    // number of transactions
+    // packages are cached separately from objects because they are immutable and can be used by any
+    // number of transactions. Note, however, that all packages are also stored in `objects` until
+    // they are flushed to disk.
     packages: MokaCache<ObjectID, PackageObject>,
 
-    // Markers for received objects and deleted shared objects. This cache can be invalidated at
-    // any time, but if there is an entry, it must contain the most recent marker for the object.
+    // Markers for received objects and deleted shared objects. This contains all of the dirty
+    // marker state, which is committed to the db at the same time as other transaction data.
+    // After markers are committed to the db we remove them from this table and insert them into
+    // marker_cache.
+    markers: DashMap<ObjectID, BTreeMap<SequenceNumber, MarkerValue>>,
+
+    // Because markers (e.g. received markers) can be read by many transactions, we also cache
+    // them. Markers are added to this cache in two ways:
+    // 1. When they are committed to the db and removed from the `markers` table.
+    // 2. After a cache miss in which we retrieve the marker from the db.
+
     // Note that MokaCache can only return items by value, so we store the map as an Arc<Mutex>.
     // (There should be no contention on the inner mutex, it is used only for interior mutability.)
-    markers: MokaCache<ObjectID, Arc<Mutex<BTreeMap<SequenceNumber, MarkerValue>>>>,
+    marker_cache: MokaCache<ObjectID, Arc<Mutex<BTreeMap<SequenceNumber, MarkerValue>>>>,
 
     // Objects that were read at transaction signing time - allows us to access them again at
     // execution time with a single lock / hash lookup
@@ -284,7 +305,7 @@ impl InMemoryCache {
             .max_capacity(10000)
             .initial_capacity(10000)
             .build();
-        let markers = MokaCache::builder()
+        let marker_cache = MokaCache::builder()
             .max_capacity(10000)
             .initial_capacity(10000)
             .build();
@@ -296,7 +317,8 @@ impl InMemoryCache {
         Self {
             objects: DashMap::new(),
             packages,
-            markers,
+            markers: DashMap::new(),
+            marker_cache,
             _transaction_objects: transaction_objects,
             transaction_effects: DashMap::new(),
             executed_effects_digests: DashMap::new(),
@@ -331,6 +353,8 @@ impl InMemoryCache {
             .insert(version, ObjectEntry::Wrapped);
     }
 
+    fn get_latest_marker(&self, object_id: &O
+
     pub fn as_notify_read_wrapper(self: Arc<Self>) -> NotifyReadWrapper {
         NotifyReadWrapper(self)
     }
@@ -355,7 +379,10 @@ impl ExecutionCacheRead for InMemoryCache {
             return Ok(Some(p));
         }
 
-        if let Some(p) = self.store.get_object(package_id)? {
+        // We try the object cache as well before going to the database. This is necessary
+        // because the package could be evicted from the package cache before it is committed
+        // to the database.
+        if let Some(p) = self.get_object(package_id)? {
             if p.is_package() {
                 let p = PackageObject::new(p);
                 self.packages.insert(*package_id, p.clone());
@@ -753,9 +780,6 @@ impl ExecutionCacheWrite for InMemoryCache {
 
         let tx_digest = *transaction.digest();
         let effects_digest = effects.digest();
-
-        self.transaction_effects
-            .insert(effects_digest, effects.clone());
 
         self.transaction_effects
             .insert(effects_digest, effects.clone());

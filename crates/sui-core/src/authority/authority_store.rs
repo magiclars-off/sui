@@ -399,6 +399,51 @@ impl AuthorityStore {
             .contains_key(digest)?)
     }
 
+    pub fn get_marker_value(
+        &self,
+        object_id: &ObjectID,
+        version: &SequenceNumber,
+        epoch_id: EpochId,
+    ) -> SuiResult<Option<MarkerValue>> {
+        XXX
+        let object_key = (epoch_id, ObjectKey(*object_id, *version));
+        Ok(self
+            .perpetual_tables
+            .object_per_epoch_marker_table
+            .get(&object_key)?)
+    }
+
+    pub fn get_latest_marker(
+        &self,
+        object_id: &ObjectID,
+        epoch_id: EpochId,
+    ) -> SuiResult<Option<(SequenceNumber, MarkerValue)>> {
+        XXX
+        let object_key = ObjectKey::max_for_id(object_id);
+        let marker_key = (epoch_id, object_key);
+
+        let marker_entry = self
+            .perpetual_tables
+            .object_per_epoch_marker_table
+            .unbounded_iter()
+            .skip_prior_to(&marker_key)?
+            .next();
+        match marker_entry {
+            Some(((epoch, key), marker)) => {
+                // Make sure object id matches
+                let object_data_ok = key.0 == *object_id;
+                // Make sure we don't have a stale epoch for some reason (e.g., a revert)
+                let epoch_data_ok = epoch == epoch_id;
+                if object_data_ok && epoch_data_ok {
+                    Ok(Some((key.1, marker)))
+                } else {
+                    Ok(None)
+                }
+            }
+            None => Ok(None),
+        }
+    }
+
     pub fn get_deleted_shared_object_previous_tx_digest(
         &self,
         object_id: &ObjectID,
