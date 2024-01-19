@@ -4,8 +4,9 @@
 use super::QueryExecutor;
 use crate::{config::Limits, error::Error};
 use async_trait::async_trait;
+use diesel::deserialize::FromSqlRow;
 use diesel::sql_function;
-use diesel::sql_types::{Int8, Nullable};
+use diesel::sql_types::{Int8, Nullable, Untyped};
 use diesel::{
     pg::Pg,
     query_builder::{Query, QueryFragment, QueryId},
@@ -89,6 +90,13 @@ impl<'c> super::DbConnection for PgConnection<'c> {
     {
         query_cost::log(self.conn, self.max_cost, query());
         query().get_results(self.conn)
+    }
+
+    fn raw_results<U>(&mut self, query: String) -> QueryResult<Vec<U>>
+    where
+        U: FromSqlRow<Untyped, Self::Backend> + 'static,
+    {
+        diesel::sql_query(query).load::<U>(self.conn)
     }
 }
 

@@ -8,14 +8,15 @@ use async_graphql::{
     *,
 };
 use diesel::{
-    query_builder::QueryFragment, query_dsl::LoadQuery, QueryDsl, QueryResult, QuerySource,
+    deserialize::FromSqlRow, query_builder::QueryFragment, query_dsl::LoadQuery,
+    sql_types::Untyped, QueryDsl, QueryResult, QuerySource,
 };
 use fastcrypto::encoding::{Base64, Encoding};
 use serde::{de::DeserializeOwned, Serialize};
 
 use crate::{
     config::ServiceConfig,
-    data::{Conn, DbConnection, DieselBackend, DieselConn, Query},
+    data::{Conn, Db, DbConnection, DieselBackend, DieselConn, Query},
     error::Error,
 };
 
@@ -76,6 +77,16 @@ pub(crate) trait Target<C: CursorType> {
     fn order<ST, GB>(asc: bool, query: Query<ST, Self::Source, GB>) -> Query<ST, Self::Source, GB>;
 
     /// The cursor pointing at this target value.
+    fn cursor(&self) -> C;
+}
+
+pub(crate) trait RawTarget<C: CursorType> {
+    fn filter_ge(cursor: &C, query: &str) -> String;
+
+    fn filter_le(cursor: &C, query: &str) -> String;
+
+    fn order(asc: bool, query: &str) -> String;
+
     fn cursor(&self) -> C;
 }
 
@@ -233,6 +244,43 @@ impl<C: CursorType + Eq + Clone + Send + Sync + 'static> Page<C> {
     }
 
     // TODO (wlmyng) tbh shouldn't be toooo hard to extend this if given a raw sql string
+    pub(crate) fn paginate_raw_query<T, Q>(
+        &self,
+        conn: &mut Conn<'_>,
+        query: Q,
+    ) -> QueryResult<(bool, bool, impl Iterator<Item = T>)>
+    where
+        Q: Fn() -> String,
+        T: Send + RawTarget<C> + Target<C> + FromSqlRow<Untyped, DieselBackend> + 'static, // TODO clean this up since we just need T::cursor
+    {
+        let mut query = query();
+
+        if let Some(after) = self.after() {
+            query = <T as RawTarget<C>>::filter_ge(after, &query);
+        }
+
+        if let Some(before) = self.before() {
+            query = <T as RawTarget<C>>::filter_le(before, &query);
+        }
+
+        query = <T as RawTarget<C>>::order(self.is_from_front(), &query);
+
+        let limit = format!("LIMIT {};", self.limit() as i64 + 2);
+
+        let results: Vec<T> = if self.limit() == 0 {
+            // Avoid the database roundtrip in the degenerate case.
+            vec![]
+        } else {
+            let mut results: Vec<T> = conn.raw_results(query)?;
+            if !self.is_from_front() {
+                results.reverse();
+            }
+            results
+        };
+
+        // The remaining bit can be split out
+        Ok(self.paginate_results(results))
+    }
 
     pub(crate) fn paginate_results<T>(
         &self,

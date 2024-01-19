@@ -5,8 +5,10 @@ pub(crate) mod pg;
 
 use async_trait::async_trait;
 use diesel::{
+    deserialize::FromSqlRow,
     query_builder::{BoxedSelectStatement, FromClause, QueryFragment, QueryId},
     query_dsl::{methods::LimitDsl, LoadQuery},
+    sql_types::Untyped,
     QueryResult,
 };
 
@@ -82,6 +84,10 @@ pub(crate) trait DbConnection {
         Q: diesel::query_builder::Query,
         Q: LoadQuery<'static, Self::Connection, U>,
         Q: QueryId + QueryFragment<Self::Backend>;
+
+    fn raw_results<U>(&mut self, query: String) -> QueryResult<Vec<U>>
+    where
+        U: FromSqlRow<Untyped, Self::Backend> + 'static;
 
     /// Helper to limit a query that fetches multiple values to return only its first value. `query`
     /// is a thunk that returns a query when called.

@@ -26,7 +26,7 @@ use sui_types::TypeTag;
 
 use super::balance;
 use super::big_int::BigInt;
-use super::cursor::{self, Page, Target};
+use super::cursor::{self, Page, RawTarget, Target};
 use super::display::{get_rendered_fields, DisplayEntry};
 use super::dynamic_field::{DynamicField, DynamicFieldName};
 use super::move_object::MoveObject;
@@ -715,7 +715,121 @@ impl Object {
         let mut conn = Connection::new(prev, next);
 
         for stored in results {
-            let cursor = stored.cursor().encode_cursor();
+            let cursor = RawTarget::cursor(&stored).encode_cursor();
+            let object = Object::try_from(stored)?;
+            conn.edges.push(Edge::new(cursor, object));
+        }
+
+        Ok(conn)
+    }
+
+    pub(crate) async fn paginate_historical_v2(
+        db: &Db,
+        page: Page<Cursor>,
+        owner_type: Option<OwnerType>,
+        checkpoint_sequence_number: Option<u64>,
+        filter: ObjectFilter,
+    ) -> Result<Connection<String, Object>, Error> {
+        let (prev, next, results) = db.execute(move |conn| {
+            page.paginate_raw_query::<StoredHistoryObject, _>(conn, move || {
+                // CTE that constructs a table similar to the live objects table. This selects
+                // the the object's state at the highest object_version at the highest
+                // checkpoint_sequence_number still within the rhs
+
+                let lhs = "COALESCE((SELECT MAX(checkpoint_sequence_number) from objects_snapshot), 0)";
+                let rhs;
+
+                let mut snapshot_query = "SELECT * FROM objects_snapshot".to_string();
+                let mut history_query = format!("SELECT * FROM objects_history WHERE checkpoint_sequence_number >= ({})", lhs);
+
+                if let Some(checkpoint_sequence_number) = checkpoint_sequence_number {
+                    snapshot_query = format!("{} WHERE checkpoint_sequence_number <= {}", snapshot_query, checkpoint_sequence_number);
+                    rhs = format!("{}", checkpoint_sequence_number);
+                } else {
+                    rhs = "SELECT MAX(sequence_number) from checkpoints".to_string();
+                }
+
+                history_query = format!("{} AND checkpoint_sequence_number <= ({})", history_query, rhs);
+
+                let mut filters: Vec<String> = Vec::new();
+
+                let object_id_filter = filter.object_ids.as_ref()
+                    .filter(|ids| !ids.is_empty())
+                    .map(|object_ids| {
+                        object_ids.iter()
+                            .map(|id| format!("'\\x{}'::bytea", hex::encode(id.into_vec())))
+                            .collect::<Vec<_>>().join(",")
+                    })
+                    .map(|filter| format!("object_id IN ({})", filter));
+
+                let object_keys_filter = filter.object_keys.as_ref()
+                    .filter(|keys| !keys.is_empty())
+                    .map(|object_keys| {
+                        object_keys.iter()
+                            .map(|ObjectKey { object_id, version }| {
+                                format!("('\\x{}'::bytea AND object_version = {})", hex::encode(object_id.into_vec()), version)
+                            })
+                            .collect::<Vec<_>>().join(" OR ")
+                    })
+                    .map(|filter| format!("({})", filter));
+
+                match (object_id_filter, object_keys_filter) {
+                    (Some(id_filter), Some(keys_filter)) => filters.push(format!("(({}) OR ({}))", id_filter, keys_filter)),
+                    (Some(id_filter), None) => filters.push(format!("({id_filter})")),
+                    (None, Some(keys_filter)) => filters.push(format!("{keys_filter})")),
+                    (None, None) => {}
+                }
+
+                if let Some(owner_type) = &owner_type {
+                    filters.push(format!("(owner_type = {})", *owner_type as i16));
+                }
+
+                if let Some(type_) = &filter.type_ {
+                    // TODO (wlmyng)
+                    // filters.push_str(" AND object_type IS NOT NULL");
+                    // query = query.filter(dsl::object_type.is_not_null());
+                    // query = type_.apply(query, dsl::object_type.assume_not_null());
+                }
+
+                if let Some(owner) = &filter.owner {
+                    filters.push(format!("(owner_id = '\\x{}'::bytea)", hex::encode(owner.into_vec())));
+
+                    filters.push(format!("(owner_type = {})", OwnerType::Address as i16));
+                }
+
+                let filters_string = if !filters.is_empty() {
+                    format!("WHERE {}", filters.join(" AND "))
+                } else {
+                    "".to_string()
+                };
+
+
+                let raw_sql = format!("WITH unioned_data AS (
+                    {}
+                    UNION
+                    {}
+                ),
+                latest_versions AS (
+                    SELECT object_id, MAX(object_version) AS max_version
+                    FROM unioned_data
+                    GROUP BY object_id
+                )
+                SELECT u.*
+                FROM unioned_data u
+                INNER JOIN latest_versions lv ON u.object_id = lv.object_id AND u.object_version = lv.max_version
+                {}", snapshot_query, history_query, filters_string);
+
+                println!("{}", raw_sql);
+
+                raw_sql
+            })
+            })
+            .await?;
+
+        let mut conn = Connection::new(prev, next);
+
+        for stored in results {
+            let cursor = RawTarget::cursor(&stored).encode_cursor();
             let object = Object::try_from(stored)?;
             conn.edges.push(Edge::new(cursor, object));
         }
@@ -1016,6 +1130,35 @@ impl Target<Cursor> for StoredHistoryObject {
             query.order_by(dsl::object_id.asc())
         } else {
             query.order_by(dsl::object_id.desc())
+        }
+    }
+
+    fn cursor(&self) -> Cursor {
+        Cursor::new(self.object_id.clone())
+    }
+}
+
+impl RawTarget<Cursor> for StoredHistoryObject {
+    fn filter_ge(cursor: &Cursor, query: &str) -> String {
+        format!(
+            "{} AND object_id > '\\x{}'::bytea",
+            query,
+            hex::encode((**cursor).clone())
+        )
+    }
+
+    fn filter_le(cursor: &Cursor, query: &str) -> String {
+        format!(
+            "{} AND object_id < '\\x{}'::bytea",
+            query,
+            hex::encode((**cursor).clone())
+        )
+    }
+
+    fn order(asc: bool, query: &str) -> String {
+        match asc {
+            true => format!("{} ORDER BY object_id ASC", query),
+            false => format!("{} ORDER BY object_id DESC", query),
         }
     }
 
