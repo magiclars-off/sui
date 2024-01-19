@@ -16,7 +16,7 @@ use serde::{de::DeserializeOwned, Serialize};
 
 use crate::{
     config::ServiceConfig,
-    data::{Conn, Db, DbConnection, DieselBackend, DieselConn, Query},
+    data::{Conn, DbConnection, DieselBackend, DieselConn, Query},
     error::Error,
 };
 
