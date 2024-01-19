@@ -246,6 +246,8 @@ impl From<Object> for ObjectEntry {
     }
 }
 
+type MarkerKey = (EpochId, ObjectID);
+
 pub struct InMemoryCache {
     // Objects are not cached using an LRU because we manage cache evictions manually due to sui
     // semantics.
@@ -260,18 +262,30 @@ pub struct InMemoryCache {
     // evicted as soon as possible. Live objects may remain in the cache in a non-dirty state
     // if we expect them to be read again soon. Or they can be evicted in order to manage the size
     // of the cache.
+
+    // The object dirty set. All writes go into this table first. After we flush the data to the
+    // db, the data is removed from this table and inserted into the object_cache. This table
+    // may contain both live and dead objects, since we flush both live and dead objects to the
+    // db in order to support past object queries on fullnodes.
+    // When we move data into the object_cache we only retain the live objects.
     objects: DashMap<ObjectID, BTreeMap<SequenceNumber, ObjectEntry>>,
 
-    // packages are cached separately from objects because they are immutable and can be used by any
-    // number of transactions. Note, however, that all packages are also stored in `objects` until
-    // they are flushed to disk.
+    // Contains live, non-package objects that have been committed to the db.
+    // TODO(cache): this is not populated yet, we will populate it when we implement flushing.
+    _object_cache: MokaCache<ObjectID, Arc<Mutex<BTreeMap<SequenceNumber, ObjectEntry>>>>,
+
+    // Packages are cached separately from objects because they are immutable and can be used by any
+    // number of transactions. Additionally, many operations require loading large numbers of packages
+    // (due to dependencies), so we want to try to keep all packages in memory.
+    // Note that, like any other dirty object, all packages are also stored in `objects` until they are
+    // flushed to disk.
     packages: MokaCache<ObjectID, PackageObject>,
 
     // Markers for received objects and deleted shared objects. This contains all of the dirty
     // marker state, which is committed to the db at the same time as other transaction data.
     // After markers are committed to the db we remove them from this table and insert them into
     // marker_cache.
-    markers: DashMap<ObjectID, BTreeMap<SequenceNumber, MarkerValue>>,
+    markers: DashMap<MarkerKey, BTreeMap<SequenceNumber, MarkerValue>>,
 
     // Because markers (e.g. received markers) can be read by many transactions, we also cache
     // them. Markers are added to this cache in two ways:
@@ -280,7 +294,7 @@ pub struct InMemoryCache {
 
     // Note that MokaCache can only return items by value, so we store the map as an Arc<Mutex>.
     // (There should be no contention on the inner mutex, it is used only for interior mutability.)
-    marker_cache: MokaCache<ObjectID, Arc<Mutex<BTreeMap<SequenceNumber, MarkerValue>>>>,
+    marker_cache: MokaCache<MarkerKey, Arc<Mutex<BTreeMap<SequenceNumber, MarkerValue>>>>,
 
     // Objects that were read at transaction signing time - allows us to access them again at
     // execution time with a single lock / hash lookup
@@ -301,6 +315,10 @@ pub struct InMemoryCache {
 
 impl InMemoryCache {
     pub fn new(store: Arc<AuthorityStore>) -> Self {
+        let object_cache = MokaCache::builder()
+            .max_capacity(10000)
+            .initial_capacity(10000)
+            .build();
         let packages = MokaCache::builder()
             .max_capacity(10000)
             .initial_capacity(10000)
@@ -316,6 +334,7 @@ impl InMemoryCache {
 
         Self {
             objects: DashMap::new(),
+            _object_cache: object_cache,
             packages,
             markers: DashMap::new(),
             marker_cache,
@@ -353,7 +372,56 @@ impl InMemoryCache {
             .insert(version, ObjectEntry::Wrapped);
     }
 
-    fn get_latest_marker(&self, object_id: &O
+    fn get_marker_value(
+        &self,
+        object_id: &ObjectID,
+        version: &SequenceNumber,
+        epoch_id: EpochId,
+    ) -> SuiResult<Option<MarkerValue>> {
+        // first check the dirty markers
+        if let Some(markers) = self.markers.get(&(epoch_id, *object_id)) {
+            if let Some(marker) = markers.get(version) {
+                return Ok(Some(*marker));
+            }
+        }
+
+        // now check the cache
+        if let Some(markers) = self.marker_cache.get(&(epoch_id, *object_id)) {
+            if let Some(marker) = markers.lock().get(version) {
+                return Ok(Some(*marker));
+            }
+        }
+
+        // fall back to the db
+        // NOTE: we cannot insert this marker into the cache, because the cache
+        // must always contain the latest marker version if it contains any marker
+        // for an object.
+        self.store.get_marker_value(object_id, version, epoch_id)
+    }
+
+    fn get_latest_marker(
+        &self,
+        object_id: &ObjectID,
+        epoch_id: EpochId,
+    ) -> SuiResult<Option<(SequenceNumber, MarkerValue)>> {
+        // Note: the reads from the dirty set and the cache are both safe, because both
+        // of these structures are guaranteed to contain the latest marker if they have
+        // an entry at all for a given object.
+
+        if let Some(markers) = self.markers.get(&(epoch_id, *object_id)) {
+            let (k, v) = get_last(&*markers);
+            return Ok(Some((*k, *v)));
+        }
+
+        if let Some(markers) = self.marker_cache.get(&(epoch_id, *object_id)) {
+            let markers = markers.lock();
+            let (k, v) = get_last(&*markers);
+            return Ok(Some((*k, *v)));
+        }
+
+        // TODO: we could insert this marker into the cache since it is the latest
+        self.store.get_latest_marker(object_id, epoch_id)
+    }
 
     pub fn as_notify_read_wrapper(self: Arc<Self>) -> NotifyReadWrapper {
         NotifyReadWrapper(self)
@@ -379,7 +447,7 @@ impl ExecutionCacheRead for InMemoryCache {
             return Ok(Some(p));
         }
 
-        // We try the object cache as well before going to the database. This is necessary
+        // We try the dirty objects cache as well before going to the database. This is necessary
         // because the package could be evicted from the package cache before it is committed
         // to the database.
         if let Some(p) = self.get_object(package_id)? {
@@ -544,15 +612,10 @@ impl ExecutionCacheRead for InMemoryCache {
         object_id: &ObjectID,
         epoch_id: EpochId,
     ) -> SuiResult<Option<(SequenceNumber, TransactionDigest)>> {
-        if let Some(markers) = self.markers.get(object_id) {
-            if let (version, MarkerValue::SharedDeleted(digest)) = get_last(&*markers.lock()) {
-                return Ok(Some((*version, *digest)));
-            }
+        match self.get_latest_marker(object_id, epoch_id)? {
+            Some((version, MarkerValue::SharedDeleted(digest))) => Ok(Some((version, digest))),
+            _ => Ok(None),
         }
-
-        // TODO: should we update the cache?
-        self.store
-            .get_last_shared_object_deletion_info(object_id, epoch_id)
     }
 
     /// If the shared object was deleted, return deletion info for the specified version.
@@ -562,14 +625,10 @@ impl ExecutionCacheRead for InMemoryCache {
         version: &SequenceNumber,
         epoch_id: EpochId,
     ) -> SuiResult<Option<TransactionDigest>> {
-        if let Some(markers) = self.markers.get(object_id) {
-            if let Some(MarkerValue::SharedDeleted(digest)) = markers.lock().get(version) {
-                return Ok(Some(*digest));
-            }
+        match self.get_marker_value(object_id, version, epoch_id)? {
+            Some(MarkerValue::SharedDeleted(digest)) => Ok(Some(digest)),
+            _ => Ok(None),
         }
-
-        self.store
-            .get_deleted_shared_object_previous_tx_digest(object_id, version, epoch_id)
     }
 
     fn have_received_object_at_version(
@@ -578,14 +637,10 @@ impl ExecutionCacheRead for InMemoryCache {
         version: SequenceNumber,
         epoch_id: EpochId,
     ) -> SuiResult<bool> {
-        if let Some(markers) = self.markers.get(object_id) {
-            if let Some(MarkerValue::Received) = markers.lock().get(&version) {
-                return Ok(true);
-            }
+        match self.get_marker_value(object_id, &version, epoch_id)? {
+            Some(MarkerValue::Received) => Ok(true),
+            _ => Ok(false),
         }
-
-        self.store
-            .have_received_object_at_version(object_id, version, epoch_id)
     }
 
     fn multi_get_transaction_blocks(
@@ -711,7 +766,7 @@ impl ExecutionCacheRead for InMemoryCache {
 
 impl ExecutionCacheWrite for InMemoryCache {
     #[instrument(level = "debug", skip_all)]
-    fn write_transaction_outputs(&self, _epoch_id: EpochId, tx_outputs: TransactionOutputs) {
+    fn write_transaction_outputs(&self, epoch_id: EpochId, tx_outputs: TransactionOutputs) {
         let TransactionOutputs {
             transaction,
             effects,
@@ -724,13 +779,12 @@ impl ExecutionCacheWrite for InMemoryCache {
             ..
         } = &tx_outputs;
 
-        // Update all marekrs
+        // Update all markers
         for (object_key, marker_value) in markers.iter() {
             self.markers
-                .entry_by_ref(&object_key.0)
-                .or_insert_with(|| Arc::new(Mutex::new(BTreeMap::new())))
-                .value()
-                .lock()
+                .entry((epoch_id, object_key.0))
+                .or_default()
+                .value_mut()
                 .insert(object_key.1, *marker_value);
         }
 

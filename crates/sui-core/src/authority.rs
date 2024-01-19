@@ -3315,6 +3315,7 @@ impl AuthorityState {
         }
     }
 
+    #[instrument(level = "trace", skip_all)]
     pub fn get_transactions_and_serialized_sizes(
         &self,
         digests: &[TransactionDigest],

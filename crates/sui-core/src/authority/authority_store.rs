@@ -405,7 +405,6 @@ impl AuthorityStore {
         version: &SequenceNumber,
         epoch_id: EpochId,
     ) -> SuiResult<Option<MarkerValue>> {
-        XXX
         let object_key = (epoch_id, ObjectKey(*object_id, *version));
         Ok(self
             .perpetual_tables
@@ -418,78 +417,24 @@ impl AuthorityStore {
         object_id: &ObjectID,
         epoch_id: EpochId,
     ) -> SuiResult<Option<(SequenceNumber, MarkerValue)>> {
-        XXX
-        let object_key = ObjectKey::max_for_id(object_id);
-        let marker_key = (epoch_id, object_key);
+        let min_key = (epoch_id, ObjectKey::min_for_id(object_id));
+        let max_key = (epoch_id, ObjectKey::max_for_id(object_id));
 
         let marker_entry = self
             .perpetual_tables
             .object_per_epoch_marker_table
-            .unbounded_iter()
-            .skip_prior_to(&marker_key)?
+            .safe_iter_with_bounds(Some(min_key), Some(max_key))
+            .skip_prior_to(&max_key)?
             .next();
         match marker_entry {
-            Some(((epoch, key), marker)) => {
-                // Make sure object id matches
-                let object_data_ok = key.0 == *object_id;
-                // Make sure we don't have a stale epoch for some reason (e.g., a revert)
-                let epoch_data_ok = epoch == epoch_id;
-                if object_data_ok && epoch_data_ok {
-                    Ok(Some((key.1, marker)))
-                } else {
-                    Ok(None)
-                }
+            Some(Ok(((epoch, key), marker))) => {
+                // because of the iterator bounds these cannot fail
+                assert_eq!(epoch, epoch_id);
+                assert_eq!(key.0, *object_id);
+                Ok(Some((key.1, marker)))
             }
+            Some(Err(e)) => Err(e.into()),
             None => Ok(None),
-        }
-    }
-
-    pub fn get_deleted_shared_object_previous_tx_digest(
-        &self,
-        object_id: &ObjectID,
-        version: &SequenceNumber,
-        epoch_id: EpochId,
-    ) -> SuiResult<Option<TransactionDigest>> {
-        let object_key = (epoch_id, ObjectKey(*object_id, *version));
-
-        match self
-            .perpetual_tables
-            .object_per_epoch_marker_table
-            .get(&object_key)?
-        {
-            Some(MarkerValue::SharedDeleted(digest)) => Ok(Some(digest)),
-            _ => Ok(None),
-        }
-    }
-
-    pub fn get_last_shared_object_deletion_info(
-        &self,
-        object_id: &ObjectID,
-        epoch_id: EpochId,
-    ) -> SuiResult<Option<(SequenceNumber, TransactionDigest)>> {
-        let object_key = ObjectKey::max_for_id(object_id);
-        let marker_key = (epoch_id, object_key);
-
-        let marker_entry = self
-            .perpetual_tables
-            .object_per_epoch_marker_table
-            .unbounded_iter()
-            .skip_prior_to(&marker_key)?
-            .next();
-        match marker_entry {
-            // Make sure the object was deleted or wrapped.
-            Some(((epoch, key), MarkerValue::SharedDeleted(digest))) => {
-                // Make sure object id matches and version is >= `version`
-                let object_id_matches = key.0 == *object_id;
-                // Make sure we don't have a stale epoch for some reason (e.g., a revert)
-                let epoch_data_ok = epoch == epoch_id;
-                if object_id_matches && epoch_data_ok {
-                    Ok(Some((key.1, digest)))
-                } else {
-                    Ok(None)
-                }
-            }
-            _ => Ok(None),
         }
     }
 
@@ -672,20 +617,6 @@ impl AuthorityStore {
             result.push(self.get_object(id)?);
         }
         Ok(result)
-    }
-
-    pub fn have_received_object_at_version(
-        &self,
-        object_id: &ObjectID,
-        version: VersionNumber,
-        epoch_id: EpochId,
-    ) -> Result<bool, SuiError> {
-        let marker_key = (epoch_id, ObjectKey(*object_id, version));
-        Ok(self
-            .perpetual_tables
-            .object_per_epoch_marker_table
-            .get(&marker_key)?
-            .is_some_and(|marker_value| marker_value == MarkerValue::Received))
     }
 
     pub fn have_deleted_owned_object_at_version_or_after(
@@ -1979,6 +1910,7 @@ impl ObjectStore for AuthorityStore {
     }
 }
 
+// TODO(cache) - must be implemented on ExecutionCacheRead
 impl ChildObjectResolver for AuthorityStore {
     fn read_child_object(
         &self,
@@ -1986,6 +1918,8 @@ impl ChildObjectResolver for AuthorityStore {
         child: &ObjectID,
         child_version_upper_bound: SequenceNumber,
     ) -> SuiResult<Option<Object>> {
+        unimplemented!();
+        /*
         let Some(child_object) =
             self.find_object_lt_or_eq_version(*child, child_version_upper_bound)
         else {
@@ -2001,6 +1935,7 @@ impl ChildObjectResolver for AuthorityStore {
             });
         }
         Ok(Some(child_object))
+        */
     }
 
     fn get_object_received_at_version(
@@ -2010,6 +1945,8 @@ impl ChildObjectResolver for AuthorityStore {
         receive_object_at_version: SequenceNumber,
         epoch_id: EpochId,
     ) -> SuiResult<Option<Object>> {
+        unimplemented!();
+        /*
         let Some(recv_object) =
             self.get_object_by_key(receiving_object_id, receive_object_at_version)?
         else {
@@ -2032,6 +1969,7 @@ impl ChildObjectResolver for AuthorityStore {
         }
 
         Ok(Some(recv_object))
+        */
     }
 }
 
