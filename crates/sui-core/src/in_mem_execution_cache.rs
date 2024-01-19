@@ -15,9 +15,8 @@ use futures::{
 use moka::sync::Cache as MokaCache;
 use mysten_common::sync::notify_read::NotifyRead;
 use parking_lot::Mutex;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
-use sui_types::base_types::{EpochId, ObjectID, ObjectRef, SequenceNumber};
 use sui_types::digests::{
     ObjectDigest, TransactionDigest, TransactionEffectsDigest, TransactionEventsDigest,
 };
@@ -28,6 +27,10 @@ use sui_types::object::Object;
 use sui_types::storage::{MarkerValue, ObjectKey, ObjectOrTombstone, ObjectStore, PackageObject};
 use sui_types::sui_system_state::{get_sui_system_state, SuiSystemState};
 use sui_types::transaction::VerifiedTransaction;
+use sui_types::{
+    base_types::{EpochId, ObjectID, ObjectRef, SequenceNumber},
+    storage::InputKey,
+};
 use tracing::instrument;
 use typed_store::Map;
 
@@ -67,27 +70,93 @@ pub trait ExecutionCacheRead: Send + Sync {
     /// when objects are not found. Returns an error if any object is not found.
     fn multi_get_object_by_objref(&self, objrefs: &[ObjectRef]) -> SuiResult<Vec<Object>>;
 
-    /// If the shared object was deleted, return deletion info for the current live version
-    fn get_last_shared_object_deletion_info(
-        &self,
-        object_id: &ObjectID,
-        epoch_id: EpochId,
-    ) -> SuiResult<Option<(SequenceNumber, TransactionDigest)>>;
-
-    /// If the shared object was deleted, return deletion info for the specified version.
-    fn get_deleted_shared_object_previous_tx_digest(
-        &self,
-        object_id: &ObjectID,
-        version: &SequenceNumber,
-        epoch_id: EpochId,
-    ) -> SuiResult<Option<TransactionDigest>>;
-
-    fn have_received_object_at_version(
+    fn object_exists_by_key(
         &self,
         object_id: &ObjectID,
         version: SequenceNumber,
-        epoch_id: EpochId,
     ) -> SuiResult<bool>;
+
+    fn multi_object_exists_by_key(&self, object_keys: &[ObjectKey]) -> SuiResult<Vec<bool>>;
+
+    /// Used by transaction manager to determine if input objects are ready. Distinct from multi_get_object_by_key
+    /// because it also consults markers to handle the case where an object will never become available (e.g.
+    /// because it has been received by some other transaction already).
+    fn multi_input_objects_available(
+        &self,
+        keys: &[InputKey],
+        receiving_objects: HashSet<InputKey>,
+        epoch: EpochId,
+    ) -> Result<Vec<bool>, SuiError> {
+        let (keys_with_version, keys_without_version): (Vec<_>, Vec<_>) =
+            keys.partition(|key| key.version().is_some());
+
+        let mut versioned_results = vec![];
+        for ((idx, input_key), has_key) in keys_with_version.iter().zip(
+            self.perpetual_tables
+                .objects
+                .multi_contains_keys(
+                    keys_with_version
+                        .iter()
+                        .map(|(_, k)| ObjectKey(k.id(), k.version().unwrap())),
+                )?
+                .into_iter(),
+        ) {
+            // If the key exists at the specified version, then the object is available.
+            if has_key {
+                versioned_results.push((*idx, true))
+            } else if receiving_objects.contains(input_key) {
+                // There could be a more recent version of this object, and the object at the
+                // specified version could have already been pruned. In such a case `has_key` will
+                // be false, but since this is a receiving object we should mark it as available if
+                // we can determine that an object with a version greater than or equal to the
+                // specified version exists or was deleted. We will then let mark it as available
+                // to let the the transaction through so it can fail at execution.
+                let is_available = self
+                    .get_object(&input_key.id())?
+                    .map(|obj| obj.version() >= input_key.version().unwrap())
+                    .unwrap_or(false)
+                    || self.have_deleted_owned_object_at_version_or_after(
+                        &input_key.id(),
+                        input_key.version().unwrap(),
+                        epoch_store.epoch(),
+                    )?;
+                versioned_results.push((*idx, is_available));
+            } else if self
+                .get_deleted_shared_object_previous_tx_digest(
+                    &input_key.id(),
+                    &input_key.version().unwrap(),
+                    epoch_store.epoch(),
+                )?
+                .is_some()
+            {
+                // If the object is an already deleted shared object, mark it as available if the
+                // version for that object is in the shared deleted marker table.
+                versioned_results.push((*idx, true));
+            } else {
+                versioned_results.push((*idx, false));
+            }
+        }
+
+        let unversioned_results = keys_without_version.into_iter().map(|(idx, key)| {
+            (
+                idx,
+                match self
+                    .get_latest_object_ref_or_tombstone(key.id())
+                    .expect("read cannot fail")
+                {
+                    None => false,
+                    Some(entry) => entry.2.is_alive(),
+                },
+            )
+        });
+
+        let mut results = versioned_results
+            .into_iter()
+            .chain(unversioned_results)
+            .collect::<Vec<_>>();
+        results.sort_by_key(|(idx, _)| *idx);
+        Ok(results.into_iter().map(|(_, result)| result).collect())
+    }
 
     fn multi_get_transaction_blocks(
         &self,
@@ -211,6 +280,60 @@ pub trait ExecutionCacheRead: Send + Sync {
     }
 
     fn get_sui_system_state_object_unsafe(&self) -> SuiResult<SuiSystemState>;
+
+    // Marker methods
+
+    /// Get the marker at a specific version
+    fn get_marker_value(
+        &self,
+        object_id: &ObjectID,
+        version: &SequenceNumber,
+        epoch_id: EpochId,
+    ) -> SuiResult<Option<MarkerValue>>;
+
+    /// Get the latest marker for a given object.
+    fn get_latest_marker(
+        &self,
+        object_id: &ObjectID,
+        epoch_id: EpochId,
+    ) -> SuiResult<Option<(SequenceNumber, MarkerValue)>>;
+
+    /// If the shared object was deleted, return deletion info for the current live version
+    fn get_last_shared_object_deletion_info(
+        &self,
+        object_id: &ObjectID,
+        epoch_id: EpochId,
+    ) -> SuiResult<Option<(SequenceNumber, TransactionDigest)>> {
+        match self.get_latest_marker(object_id, epoch_id)? {
+            Some((version, MarkerValue::SharedDeleted(digest))) => Ok(Some((version, digest))),
+            _ => Ok(None),
+        }
+    }
+
+    /// If the shared object was deleted, return deletion info for the specified version.
+    fn get_deleted_shared_object_previous_tx_digest(
+        &self,
+        object_id: &ObjectID,
+        version: &SequenceNumber,
+        epoch_id: EpochId,
+    ) -> SuiResult<Option<TransactionDigest>> {
+        match self.get_marker_value(object_id, version, epoch_id)? {
+            Some(MarkerValue::SharedDeleted(digest)) => Ok(Some(digest)),
+            _ => Ok(None),
+        }
+    }
+
+    fn have_received_object_at_version(
+        &self,
+        object_id: &ObjectID,
+        version: SequenceNumber,
+        epoch_id: EpochId,
+    ) -> SuiResult<bool> {
+        match self.get_marker_value(object_id, &version, epoch_id)? {
+            Some(MarkerValue::Received) => Ok(true),
+            _ => Ok(false),
+        }
+    }
 }
 
 pub trait ExecutionCacheWrite: Send + Sync {
@@ -248,6 +371,15 @@ impl From<Object> for ObjectEntry {
 
 type MarkerKey = (EpochId, ObjectID);
 
+enum CacheResult<T> {
+    /// Entry is in the cache
+    Hit(T),
+    /// Entry is not in the cache and is known to not exist
+    NegativeHit,
+    /// Entry is not in the cache and may or may not exist in the store
+    Miss,
+}
+
 pub struct InMemoryCache {
     // Objects are not cached using an LRU because we manage cache evictions manually due to sui
     // semantics.
@@ -272,7 +404,7 @@ pub struct InMemoryCache {
 
     // Contains live, non-package objects that have been committed to the db.
     // TODO(cache): this is not populated yet, we will populate it when we implement flushing.
-    _object_cache: MokaCache<ObjectID, Arc<Mutex<BTreeMap<SequenceNumber, ObjectEntry>>>>,
+    object_cache: MokaCache<ObjectID, Arc<Mutex<BTreeMap<SequenceNumber, ObjectEntry>>>>,
 
     // Packages are cached separately from objects because they are immutable and can be used by any
     // number of transactions. Additionally, many operations require loading large numbers of packages
@@ -334,7 +466,7 @@ impl InMemoryCache {
 
         Self {
             objects: DashMap::new(),
-            _object_cache: object_cache,
+            object_cache,
             packages,
             markers: DashMap::new(),
             marker_cache,
@@ -372,55 +504,37 @@ impl InMemoryCache {
             .insert(version, ObjectEntry::Wrapped);
     }
 
-    fn get_marker_value(
+    fn get_object_by_key_cache_only(
         &self,
         object_id: &ObjectID,
-        version: &SequenceNumber,
-        epoch_id: EpochId,
-    ) -> SuiResult<Option<MarkerValue>> {
-        // first check the dirty markers
-        if let Some(markers) = self.markers.get(&(epoch_id, *object_id)) {
-            if let Some(marker) = markers.get(version) {
-                return Ok(Some(*marker));
-            }
+        version: SequenceNumber,
+    ) -> CacheResult<Object> {
+        macro_rules! check_cache_entry {
+            ($objects: expr) => {
+                if let Some(object) = $objects.get(&version) {
+                    if let ObjectEntry::Object(object) = object {
+                        return CacheResult::Hit(object.clone());
+                    }
+                }
+
+                if get_last(&*$objects).0 < &version {
+                    // If the version is greater than the last version in the cache, then we know
+                    // that the object does not exist anywhere
+                    return CacheResult::NegativeHit;
+                }
+            };
         }
 
-        // now check the cache
-        if let Some(markers) = self.marker_cache.get(&(epoch_id, *object_id)) {
-            if let Some(marker) = markers.lock().get(version) {
-                return Ok(Some(*marker));
-            }
+        if let Some(objects) = self.objects.get(object_id) {
+            check_cache_entry!(objects);
         }
 
-        // fall back to the db
-        // NOTE: we cannot insert this marker into the cache, because the cache
-        // must always contain the latest marker version if it contains any marker
-        // for an object.
-        self.store.get_marker_value(object_id, version, epoch_id)
-    }
-
-    fn get_latest_marker(
-        &self,
-        object_id: &ObjectID,
-        epoch_id: EpochId,
-    ) -> SuiResult<Option<(SequenceNumber, MarkerValue)>> {
-        // Note: the reads from the dirty set and the cache are both safe, because both
-        // of these structures are guaranteed to contain the latest marker if they have
-        // an entry at all for a given object.
-
-        if let Some(markers) = self.markers.get(&(epoch_id, *object_id)) {
-            let (k, v) = get_last(&*markers);
-            return Ok(Some((*k, *v)));
+        if let Some(objects) = self.object_cache.get(object_id) {
+            let objects = objects.lock();
+            check_cache_entry!(objects);
         }
 
-        if let Some(markers) = self.marker_cache.get(&(epoch_id, *object_id)) {
-            let markers = markers.lock();
-            let (k, v) = get_last(&*markers);
-            return Ok(Some((*k, *v)));
-        }
-
-        // TODO: we could insert this marker into the cache since it is the latest
-        self.store.get_latest_marker(object_id, epoch_id)
+        CachResult::Miss
     }
 
     pub fn as_notify_read_wrapper(self: Arc<Self>) -> NotifyReadWrapper {
@@ -491,6 +605,15 @@ impl ExecutionCacheRead for InMemoryCache {
             };
         }
 
+        if let Some(objects) = self.object_cache.get(id) {
+            let objects = objects.lock();
+            // If any version of the object is in the cache, it must be the most recent version.
+            return match get_last(&*objects).1 {
+                ObjectEntry::Object(object) => Ok(Some(object.clone())),
+                _ => Ok(None),
+            };
+        }
+
         // We don't insert objects into the cache because they are usually only
         // read once.
         // TODO: we might want to cache immutable reads (RO shared objects and immutable objects)
@@ -502,19 +625,13 @@ impl ExecutionCacheRead for InMemoryCache {
         object_id: &ObjectID,
         version: SequenceNumber,
     ) -> SuiResult<Option<Object>> {
-        if let Some(objects) = self.objects.get(object_id) {
-            if let Some(object) = objects.get(&version) {
-                if let ObjectEntry::Object(object) = object {
-                    return Ok(Some(object.clone()));
-                } else {
-                    return Ok(None);
-                }
-            }
+        match self.get_object_by_key_cache_only(object_id, version) {
+            CacheResult::Hit(object) => Ok(Some(object)),
+            CacheResult::NegativeHit => Ok(None),
+            // We don't insert objects into the cache after a miss because they are usually only
+            // read once.
+            CacheResult::Miss => self.store.get_object_by_key(object_id, version),
         }
-
-        // We don't insert objects into the cache because they are usually only
-        // read once.
-        self.store.get_object_by_key(object_id, version)
     }
 
     fn multi_get_object_by_key(
@@ -526,11 +643,13 @@ impl ExecutionCacheRead for InMemoryCache {
         let mut fetch_indices = Vec::with_capacity(object_keys.len());
 
         for (i, key) in object_keys.iter().enumerate() {
-            if let Some(object) = self.get_object_by_key(&key.0, key.1)? {
-                results[i] = Some(object);
-            } else {
-                fallback_keys.push(*key);
-                fetch_indices.push(i);
+            match self.get_object_by_key_cache_only(object_id, version) {
+                CacheResult::Hit(object) => results[i] = Some(object),
+                CacheResult::NegativeHit => (),
+                CacheResult::Miss => {
+                    fallback_keys.push(*key);
+                    fetch_indices.push(i);
+                }
             }
         }
 
@@ -551,11 +670,20 @@ impl ExecutionCacheRead for InMemoryCache {
         let mut fetch_indices = Vec::with_capacity(objrefs.len());
 
         for (i, objref) in objrefs.iter().enumerate() {
-            if let Some(object) = self.get_object_by_key(&objref.0, objref.1)? {
-                results[i] = Some(object);
-            } else {
-                fallback_keys.push(*objref);
-                fetch_indices.push(i);
+            match self.get_object_by_key_cache_only(&objref.0, objref.1) {
+                CacheResult::Hit(object) => results[i] = Some(object),
+                CacheResult::NegativeHit => {
+                    return Err(SuiError::UserInputError {
+                        error: UserInputError::ObjectNotFound {
+                            object_id: objref.0,
+                            version: objref.1,
+                        },
+                    })
+                }
+                CacheResult::Miss => {
+                    fallback_keys.push(*objref);
+                    fetch_indices.push(i);
+                }
             }
         }
 
@@ -570,6 +698,44 @@ impl ExecutionCacheRead for InMemoryCache {
         }
 
         Ok(results.into_iter().map(|r| r.unwrap()).collect())
+    }
+
+    fn object_exists_by_key(
+        &self,
+        object_id: &ObjectID,
+        version: SequenceNumber,
+    ) -> SuiResult<bool> {
+        if self
+            .get_object_by_key_cache_only(object_id, version)
+            .is_some()
+        {
+            return Ok(true);
+        }
+    }
+
+    fn multi_object_exists_by_key(&self, object_keys: &[ObjectKey]) -> SuiResult<Vec<bool>> {
+        let mut results = vec![false; object_keys.len()];
+        let mut fallback_keys = Vec::with_capacity(object_keys.len());
+        let mut fetch_indices = Vec::with_capacity(object_keys.len());
+
+        for (i, key) in object_keys.iter().enumerate() {
+            if self.object_exists_by_key(&key.0, key.1)? {
+                results[i] = true;
+            } else {
+                fallback_keys.push(*key);
+                fetch_indices.push(i);
+            }
+        }
+
+        let store_results = self.store.multi_object_exists_by_key(&fallback_keys)?;
+        assert_eq!(store_results.len(), fetch_indices.len());
+        assert_eq!(store_results.len(), fallback_keys.len());
+
+        for (i, result) in fetch_indices.into_iter().zip(store_results.into_iter()) {
+            results[i] = result;
+        }
+
+        Ok(results)
     }
 
     fn get_latest_object_ref_or_tombstone(
@@ -604,43 +770,6 @@ impl ExecutionCacheRead for InMemoryCache {
         }
 
         self.store.get_latest_object_or_tombstone(object_id)
-    }
-
-    /// If the shared object was deleted, return deletion info for the current live version
-    fn get_last_shared_object_deletion_info(
-        &self,
-        object_id: &ObjectID,
-        epoch_id: EpochId,
-    ) -> SuiResult<Option<(SequenceNumber, TransactionDigest)>> {
-        match self.get_latest_marker(object_id, epoch_id)? {
-            Some((version, MarkerValue::SharedDeleted(digest))) => Ok(Some((version, digest))),
-            _ => Ok(None),
-        }
-    }
-
-    /// If the shared object was deleted, return deletion info for the specified version.
-    fn get_deleted_shared_object_previous_tx_digest(
-        &self,
-        object_id: &ObjectID,
-        version: &SequenceNumber,
-        epoch_id: EpochId,
-    ) -> SuiResult<Option<TransactionDigest>> {
-        match self.get_marker_value(object_id, version, epoch_id)? {
-            Some(MarkerValue::SharedDeleted(digest)) => Ok(Some(digest)),
-            _ => Ok(None),
-        }
-    }
-
-    fn have_received_object_at_version(
-        &self,
-        object_id: &ObjectID,
-        version: SequenceNumber,
-        epoch_id: EpochId,
-    ) -> SuiResult<bool> {
-        match self.get_marker_value(object_id, &version, epoch_id)? {
-            Some(MarkerValue::Received) => Ok(true),
-            _ => Ok(false),
-        }
     }
 
     fn multi_get_transaction_blocks(
@@ -761,6 +890,57 @@ impl ExecutionCacheRead for InMemoryCache {
 
     fn get_sui_system_state_object_unsafe(&self) -> SuiResult<SuiSystemState> {
         get_sui_system_state(&ObjectStoreWrapper(self))
+    }
+
+    fn get_marker_value(
+        &self,
+        object_id: &ObjectID,
+        version: &SequenceNumber,
+        epoch_id: EpochId,
+    ) -> SuiResult<Option<MarkerValue>> {
+        // first check the dirty markers
+        if let Some(markers) = self.markers.get(&(epoch_id, *object_id)) {
+            if let Some(marker) = markers.get(version) {
+                return Ok(Some(*marker));
+            }
+        }
+
+        // now check the cache
+        if let Some(markers) = self.marker_cache.get(&(epoch_id, *object_id)) {
+            if let Some(marker) = markers.lock().get(version) {
+                return Ok(Some(*marker));
+            }
+        }
+
+        // fall back to the db
+        // NOTE: we cannot insert this marker into the cache, because the cache
+        // must always contain the latest marker version if it contains any marker
+        // for an object.
+        self.store.get_marker_value(object_id, version, epoch_id)
+    }
+
+    fn get_latest_marker(
+        &self,
+        object_id: &ObjectID,
+        epoch_id: EpochId,
+    ) -> SuiResult<Option<(SequenceNumber, MarkerValue)>> {
+        // Note: the reads from the dirty set and the cache are both safe, because both
+        // of these structures are guaranteed to contain the latest marker if they have
+        // an entry at all for a given object.
+
+        if let Some(markers) = self.markers.get(&(epoch_id, *object_id)) {
+            let (k, v) = get_last(&*markers);
+            return Ok(Some((*k, *v)));
+        }
+
+        if let Some(markers) = self.marker_cache.get(&(epoch_id, *object_id)) {
+            let markers = markers.lock();
+            let (k, v) = get_last(&*markers);
+            return Ok(Some((*k, *v)));
+        }
+
+        // TODO: we could insert this marker into the cache since it is the latest
+        self.store.get_latest_marker(object_id, epoch_id)
     }
 }
 

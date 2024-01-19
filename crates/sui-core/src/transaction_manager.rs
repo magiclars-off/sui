@@ -486,7 +486,7 @@ impl TransactionManager {
         let cache_miss_availability = self
             .authority_store
             .multi_input_objects_available(
-                input_object_cache_misses.iter().cloned(),
+                &input_object_cache_misses,
                 receiving_objects,
                 epoch_store,
             )
