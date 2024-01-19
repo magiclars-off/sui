@@ -29,9 +29,9 @@ impl DebugCommand {
     pub fn debug_string(&self) -> &str {
         match self {
             Self::PrintStack => "stack",
-            Self::Step => "step",
-            Self::Continue => "continue",
-            Self::Breakpoint(_) => "breakpoint ",
+            Self::Step => "s",
+            Self::Continue => "c",
+            Self::Breakpoint(_) => "b ",
             Self::DeleteBreakpoint(_) => "delete ",
             Self::PrintBreakpoints => "breakpoints",
             Self::Help => "help",
@@ -118,6 +118,31 @@ impl DebugContext {
             .collect();
     }
 
+    fn print_stack(function_desc: &Function, locals: &Locals, pc: u16, interp: &Interpreter, resolver: &Loader ) {
+        let function_string = function_desc.pretty_short_string();
+        let mut s = String::new();
+        interp.debug_print_stack_trace(&mut s, resolver).unwrap();
+        println!("{}", s);
+        println!("Current frame: {}\n", function_string);
+        let code = function_desc.code();
+        println!("        Code:");
+        for (i, instr) in code.iter().enumerate() {
+            if i as u16 == pc {
+                println!("          > [{}] {:?}", pc, instr);
+            } else {
+                println!("            [{}] {:?}", i, instr);
+            }
+        }
+        println!("        Locals:");
+        if function_desc.local_count() > 0 {
+            let mut s = String::new();
+            values::debug::print_locals(&mut s, locals).unwrap();
+            println!("{}", s);
+        } else {
+            println!("            (none)");
+        }
+    }
+
     pub(crate) fn debug_loop(
         &mut self,
         function_desc: &Function,
@@ -151,6 +176,7 @@ impl DebugContext {
                 "function >> {}\ninstruction >> {:?}\nprogram counter >> {}",
                 function_string, instr, pc
             );
+            Self::print_stack(function_desc, locals, pc, interp, resolver);
             loop {
                 print!("> ");
                 std::io::stdout().flush().unwrap();
@@ -183,35 +209,15 @@ impl DebugContext {
                                 .enumerate()
                                 .for_each(|(i, bp)| println!("[{}] {}", i, bp)),
                             DebugCommand::PrintStack => {
-                                let mut s = String::new();
-                                interp.debug_print_stack_trace(&mut s, resolver).unwrap();
-                                println!("{}", s);
-                                println!("Current frame: {}\n", function_string);
-                                let code = function_desc.code();
-                                println!("        Code:");
-                                for (i, instr) in code.iter().enumerate() {
-                                    if i as u16 == pc {
-                                        println!("          > [{}] {:?}", pc, instr);
-                                    } else {
-                                        println!("            [{}] {:?}", i, instr);
-                                    }
-                                }
-                                println!("        Locals:");
-                                if function_desc.local_count() > 0 {
-                                    let mut s = String::new();
-                                    values::debug::print_locals(&mut s, locals).unwrap();
-                                    println!("{}", s);
-                                } else {
-                                    println!("            (none)");
-                                }
+                                Self::print_stack(function_desc, locals, pc, interp, resolver);
                             }
                             DebugCommand::Help => {
                                 println!(
                                     "Available commands:\n\
                                     \tstack: print the current state of the call and value stacks\n\
-                                    \tstep: step forward one instruction\n\
-                                    \tcontinue: continue execution until the next breakpoint\n\
-                                    \tbreakpoint <string>:\n\
+                                    \ts: step forward one instruction\n\
+                                    \tc: continue execution until the next breakpoint\n\
+                                    \tb <string>:\n\
                                     \t\t1. set a breakpoint at the given bytecode instruction that starts with <string>, e.g., Call or CallGeneric\n\
                                     \t\t2. set a breakpoint at the function that matches <string>, e.g., 0x2::vector::pop_back\n\
                                     \t\t3. set a breakpoint at the given code offset, e.g., 10 will stop execution if a code offset of 10 is encountered\n\
