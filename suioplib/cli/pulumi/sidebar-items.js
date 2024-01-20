@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"enum":["PulumiAction"],"fn":["adjust_pyproject","pulumi_cmd"],"struct":["PulumiArgs"]};
