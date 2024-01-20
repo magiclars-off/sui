@@ -960,8 +960,7 @@ impl ExecutionCacheRead for InMemoryCache {
     }
 
     fn get_sui_system_state_object_unsafe(&self) -> SuiResult<SuiSystemState> {
-        todo!()
-        //get_sui_system_state(&self.clone().as_backing_store())
+        get_sui_system_state(self)
     }
 
     fn get_marker_value(

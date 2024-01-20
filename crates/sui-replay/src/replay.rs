@@ -40,7 +40,6 @@ use sui_core::{
 };
 use sui_execution::Executor;
 use sui_framework::BuiltInFramework;
-use sui_json_rpc::authority_state::StateRead;
 use sui_json_rpc_types::{SuiTransactionBlockEffects, SuiTransactionBlockEffectsAPI};
 use sui_protocol_config::{Chain, ProtocolConfig};
 use sui_sdk::{SuiClient, SuiClientBuilder};

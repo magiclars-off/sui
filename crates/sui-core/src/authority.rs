@@ -744,7 +744,7 @@ impl AuthorityState {
             &input_object_kinds,
             &receiving_objects_refs,
             &self.transaction_deny_config,
-            &*self.get_cache_reader(),
+            self.get_cache_reader().as_ref(),
         )?;
 
         let (input_objects, receiving_objects) = self
@@ -1398,7 +1398,7 @@ impl AuthorityState {
         #[allow(unused_mut)]
         let (inner_temp_store, mut effects, execution_error_opt) =
             epoch_store.executor().execute_transaction_to_effects(
-                &*self.get_cache_reader(),
+                self.get_cache_reader().as_ref(),
                 protocol_config,
                 self.metrics.limits_metrics.clone(),
                 // TODO: would be nice to pass the whole NodeConfig here, but it creates a
@@ -1463,7 +1463,7 @@ impl AuthorityState {
             &input_object_kinds,
             &receiving_object_refs,
             &self.transaction_deny_config,
-            &*self.get_cache_reader(),
+            self.get_cache_reader().as_ref(),
         )?;
 
         let (input_objects, receiving_objects) = self
@@ -1528,7 +1528,7 @@ impl AuthorityState {
         let expensive_checks = false;
         let (inner_temp_store, effects, _execution_error) = executor
             .execute_transaction_to_effects(
-                &*self.get_cache_reader(),
+                self.get_cache_reader().as_ref(),
                 protocol_config,
                 self.metrics.limits_metrics.clone(),
                 expensive_checks,
@@ -1673,7 +1673,7 @@ impl AuthorityState {
             &input_object_kinds,
             &receiving_object_refs,
             &self.transaction_deny_config,
-            &*self.get_cache_reader(),
+            self.get_cache_reader().as_ref(),
         )?;
 
         let (mut input_objects, receiving_objects) = self
@@ -1759,7 +1759,7 @@ impl AuthorityState {
         );
         let transaction_digest = TransactionDigest::new(default_hash(&intent_msg.value));
         let (inner_temp_store, effects, execution_result) = executor.dev_inspect_transaction(
-            &*self.get_cache_reader(),
+            self.get_cache_reader().as_ref(),
             protocol_config,
             self.metrics.limits_metrics.clone(),
             /* expensive checks */ false,
@@ -2238,7 +2238,7 @@ impl AuthorityState {
             Some(
                 self.load_epoch_store_one_call_per_task()
                     .executor()
-                    .type_layout_resolver(Box::new(&*self.get_cache_reader()))
+                    .type_layout_resolver(Box::new(self.get_cache_reader().as_ref()))
                     .get_annotated_layout(&move_obj.type_().clone().into())?,
             )
         } else {
