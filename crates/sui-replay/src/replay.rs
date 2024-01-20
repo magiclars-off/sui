@@ -40,6 +40,7 @@ use sui_core::{
 };
 use sui_execution::Executor;
 use sui_framework::BuiltInFramework;
+use sui_json_rpc::authority_state::StateRead;
 use sui_json_rpc_types::{SuiTransactionBlockEffects, SuiTransactionBlockEffectsAPI};
 use sui_protocol_config::{Chain, ProtocolConfig};
 use sui_sdk::{SuiClient, SuiClientBuilder};
@@ -2133,7 +2134,7 @@ async fn create_epoch_store(
         None,
         EpochMetrics::new(&registry),
         epoch_start_config,
-        authority_state.database.clone(),
+        authority_state.get_cache_reader().clone(),
         cache_metrics,
         signature_verifier_metrics,
         &ExpensiveSafetyCheckConfig::default(),

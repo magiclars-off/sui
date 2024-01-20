@@ -24,11 +24,15 @@ use sui_types::effects::{TransactionEffects, TransactionEvents};
 use sui_types::error::{SuiError, SuiResult, UserInputError};
 use sui_types::message_envelope::Message;
 use sui_types::object::Object;
-use sui_types::storage::{MarkerValue, ObjectKey, ObjectOrTombstone, ObjectStore, PackageObject};
+use sui_types::storage::{
+    BackingPackageStore, ChildObjectResolver, MarkerValue, ObjectKey, ObjectOrTombstone,
+    ObjectStore, PackageObject, ParentSync,
+};
 use sui_types::sui_system_state::{get_sui_system_state, SuiSystemState};
 use sui_types::transaction::VerifiedTransaction;
 use sui_types::{
     base_types::{EpochId, ObjectID, ObjectRef, SequenceNumber},
+    object::Owner,
     storage::InputKey,
 };
 use tracing::instrument;
@@ -66,10 +70,6 @@ pub trait ExecutionCacheRead: Send + Sync {
 
     fn multi_get_object_by_key(&self, object_keys: &[ObjectKey]) -> SuiResult<Vec<Option<Object>>>;
 
-    /// Variant of multi_get_object_by_key used by transaction signing that returns better error messages
-    /// when objects are not found. Returns an error if any object is not found.
-    fn multi_get_object_by_objref(&self, objrefs: &[ObjectRef]) -> SuiResult<Vec<Object>>;
-
     fn object_exists_by_key(
         &self,
         object_id: &ObjectID,
@@ -77,6 +77,47 @@ pub trait ExecutionCacheRead: Send + Sync {
     ) -> SuiResult<bool>;
 
     fn multi_object_exists_by_key(&self, object_keys: &[ObjectKey]) -> SuiResult<Vec<bool>>;
+
+    /// Load a list of objects from the store by object reference.
+    /// If they exist in the store, they are returned directly.
+    /// If any object missing, we try to figure out the best error to return.
+    /// If the object we are asking is currently locked at a future version, we know this
+    /// transaction is out-of-date and we return a ObjectVersionUnavailableForConsumption,
+    /// which indicates this is not retriable.
+    /// Otherwise, we return a ObjectNotFound error, which indicates this is retriable.
+    fn multi_get_object_with_more_accurate_error_return(
+        &self,
+        object_refs: &[ObjectRef],
+    ) -> Result<Vec<Object>, SuiError> {
+        let objects = self.multi_get_object_by_key(
+            &object_refs.iter().map(ObjectKey::from).collect::<Vec<_>>(),
+        )?;
+        let mut result = Vec::new();
+        for (object_opt, object_ref) in objects.into_iter().zip(object_refs) {
+            match object_opt {
+                None => {
+                    let lock = self.get_latest_lock_for_object_id(object_ref.0)?;
+                    let error = if lock.1 >= object_ref.1 {
+                        UserInputError::ObjectVersionUnavailableForConsumption {
+                            provided_obj_ref: *object_ref,
+                            current_version: lock.1,
+                        }
+                    } else {
+                        UserInputError::ObjectNotFound {
+                            object_id: object_ref.0,
+                            version: Some(object_ref.1),
+                        }
+                    };
+                    return Err(SuiError::UserInputError { error });
+                }
+                Some(object) => {
+                    result.push(object);
+                }
+            }
+        }
+        assert_eq!(result.len(), object_refs.len());
+        Ok(result)
+    }
 
     /// Used by transaction manager to determine if input objects are ready. Distinct from multi_get_object_by_key
     /// because it also consults markers to handle the case where an object will never become available (e.g.
@@ -87,19 +128,20 @@ pub trait ExecutionCacheRead: Send + Sync {
         receiving_objects: HashSet<InputKey>,
         epoch: EpochId,
     ) -> Result<Vec<bool>, SuiError> {
-        let (keys_with_version, keys_without_version): (Vec<_>, Vec<_>) =
-            keys.partition(|key| key.version().is_some());
+        let (keys_with_version, keys_without_version): (Vec<_>, Vec<_>) = keys
+            .iter()
+            .enumerate()
+            .partition(|(_, key)| key.version().is_some());
 
         let mut versioned_results = vec![];
         for ((idx, input_key), has_key) in keys_with_version.iter().zip(
-            self.perpetual_tables
-                .objects
-                .multi_contains_keys(
-                    keys_with_version
-                        .iter()
-                        .map(|(_, k)| ObjectKey(k.id(), k.version().unwrap())),
-                )?
-                .into_iter(),
+            self.multi_object_exists_by_key(
+                &keys_with_version
+                    .iter()
+                    .map(|(_, k)| ObjectKey(k.id(), k.version().unwrap()))
+                    .collect::<Vec<_>>(),
+            )?
+            .into_iter(),
         ) {
             // If the key exists at the specified version, then the object is available.
             if has_key {
@@ -118,14 +160,14 @@ pub trait ExecutionCacheRead: Send + Sync {
                     || self.have_deleted_owned_object_at_version_or_after(
                         &input_key.id(),
                         input_key.version().unwrap(),
-                        epoch_store.epoch(),
+                        epoch,
                     )?;
                 versioned_results.push((*idx, is_available));
             } else if self
                 .get_deleted_shared_object_previous_tx_digest(
                     &input_key.id(),
                     &input_key.version().unwrap(),
-                    epoch_store.epoch(),
+                    epoch,
                 )?
                 .is_some()
             {
@@ -157,6 +199,18 @@ pub trait ExecutionCacheRead: Send + Sync {
         results.sort_by_key(|(idx, _)| *idx);
         Ok(results.into_iter().map(|(_, result)| result).collect())
     }
+
+    /// Return the object with version less then or eq to the provided seq number.
+    /// This is used by indexer to find the correct version of dynamic field child object.
+    /// We do not store the version of the child object, but because of lamport timestamp,
+    /// we know the child must have version number less then or eq to the parent.
+    fn find_object_lt_or_eq_version(
+        &self,
+        object_id: ObjectID,
+        version: SequenceNumber,
+    ) -> Option<Object>;
+
+    fn get_latest_lock_for_object_id(&self, object_id: ObjectID) -> SuiResult<ObjectRef>;
 
     fn multi_get_transaction_blocks(
         &self,
@@ -334,6 +388,20 @@ pub trait ExecutionCacheRead: Send + Sync {
             _ => Ok(false),
         }
     }
+
+    fn have_deleted_owned_object_at_version_or_after(
+        &self,
+        object_id: &ObjectID,
+        version: SequenceNumber,
+        epoch_id: EpochId,
+    ) -> SuiResult<bool> {
+        match self.get_latest_marker(object_id, epoch_id)? {
+            Some((marker_version, MarkerValue::OwnedDeleted)) if marker_version >= version => {
+                Ok(true)
+            }
+            _ => Ok(false),
+        }
+    }
 }
 
 pub trait ExecutionCacheWrite: Send + Sync {
@@ -381,28 +449,25 @@ enum CacheResult<T> {
 }
 
 pub struct InMemoryCache {
-    // Objects are not cached using an LRU because we manage cache evictions manually due to sui
-    // semantics.
-    //
-    // The main consistency rule is that there cannot be a more recent version of the object in
-    // the db than the most recent one in the cache.  This is because all writes go through the
-    // cache, and we evict older versions first.
-    //
-    // Data in this table may be either dirty or clean (committed to db). It is dirty after a
-    // transaction has been executed but before it has been committed to the db. After data has
-    // been committed to the db, the object may or may not be evicted. Dead objects are always
-    // evicted as soon as possible. Live objects may remain in the cache in a non-dirty state
-    // if we expect them to be read again soon. Or they can be evicted in order to manage the size
-    // of the cache.
-
-    // The object dirty set. All writes go into this table first. After we flush the data to the
-    // db, the data is removed from this table and inserted into the object_cache. This table
-    // may contain both live and dead objects, since we flush both live and dead objects to the
-    // db in order to support past object queries on fullnodes.
-    // When we move data into the object_cache we only retain the live objects.
+    /// The object dirty set. All writes go into this table first. After we flush the data to the
+    /// db, the data is removed from this table and inserted into the object_cache.
+    ///
+    /// This table may contain both live and dead objects, since we flush both live and dead
+    /// objects to the db in order to support past object queries on fullnodes.
+    /// When we move data into the object_cache we only retain the live objects.
+    ///
+    /// Further, we only remove objects in FIFO order, which ensures that the the cached
+    /// sequence of objects has no gaps. In other words, if we have versions 4, 8, 13 of
+    /// an object, we can deduce that version 9 does not exist. This also makes child object
+    /// reads efficient. `object_cache` cannot contain a more recent version of an object than
+    /// `objects`, and neither can have any gaps. Therefore if there is any object <= the version
+    /// bound for a child read in objects, it is the correct object to return.
     objects: DashMap<ObjectID, BTreeMap<SequenceNumber, ObjectEntry>>,
 
-    // Contains live, non-package objects that have been committed to the db.
+    /// Contains live, non-package objects that have been committed to the db.
+    /// As with `objects`, we remove objects from this table in FIFO order (or we allow the cache
+    /// to evict all versions of the object at once), which ensures that the the cached sequence
+    /// of objects has no gaps. See the comment above for more details.
     // TODO(cache): this is not populated yet, we will populate it when we implement flushing.
     object_cache: MokaCache<ObjectID, Arc<Mutex<BTreeMap<SequenceNumber, ObjectEntry>>>>,
 
@@ -514,6 +579,9 @@ impl InMemoryCache {
                 if let Some(object) = $objects.get(&version) {
                     if let ObjectEntry::Object(object) = object {
                         return CacheResult::Hit(object.clone());
+                    } else {
+                        // object exists but is a tombstone
+                        return CacheResult::NegativeHit;
                     }
                 }
 
@@ -534,7 +602,7 @@ impl InMemoryCache {
             check_cache_entry!(objects);
         }
 
-        CachResult::Miss
+        CacheResult::Miss
     }
 
     pub fn as_notify_read_wrapper(self: Arc<Self>) -> NotifyReadWrapper {
@@ -564,7 +632,7 @@ impl ExecutionCacheRead for InMemoryCache {
         // We try the dirty objects cache as well before going to the database. This is necessary
         // because the package could be evicted from the package cache before it is committed
         // to the database.
-        if let Some(p) = self.get_object(package_id)? {
+        if let Some(p) = ExecutionCacheRead::get_object(self, package_id)? {
             if p.is_package() {
                 let p = PackageObject::new(p);
                 self.packages.insert(*package_id, p.clone());
@@ -643,7 +711,7 @@ impl ExecutionCacheRead for InMemoryCache {
         let mut fetch_indices = Vec::with_capacity(object_keys.len());
 
         for (i, key) in object_keys.iter().enumerate() {
-            match self.get_object_by_key_cache_only(object_id, version) {
+            match self.get_object_by_key_cache_only(&key.0, key.1) {
                 CacheResult::Hit(object) => results[i] = Some(object),
                 CacheResult::NegativeHit => (),
                 CacheResult::Miss => {
@@ -664,52 +732,15 @@ impl ExecutionCacheRead for InMemoryCache {
         Ok(results)
     }
 
-    fn multi_get_object_by_objref(&self, objrefs: &[ObjectRef]) -> SuiResult<Vec<Object>> {
-        let mut results = vec![None; objrefs.len()];
-        let mut fallback_keys = Vec::with_capacity(objrefs.len());
-        let mut fetch_indices = Vec::with_capacity(objrefs.len());
-
-        for (i, objref) in objrefs.iter().enumerate() {
-            match self.get_object_by_key_cache_only(&objref.0, objref.1) {
-                CacheResult::Hit(object) => results[i] = Some(object),
-                CacheResult::NegativeHit => {
-                    return Err(SuiError::UserInputError {
-                        error: UserInputError::ObjectNotFound {
-                            object_id: objref.0,
-                            version: objref.1,
-                        },
-                    })
-                }
-                CacheResult::Miss => {
-                    fallback_keys.push(*objref);
-                    fetch_indices.push(i);
-                }
-            }
-        }
-
-        let store_results = self
-            .store
-            .multi_get_object_with_more_accurate_error_return(&fallback_keys)?;
-        assert_eq!(store_results.len(), fetch_indices.len());
-        assert_eq!(store_results.len(), fallback_keys.len());
-
-        for (i, result) in fetch_indices.into_iter().zip(store_results.into_iter()) {
-            results[i] = Some(result);
-        }
-
-        Ok(results.into_iter().map(|r| r.unwrap()).collect())
-    }
-
     fn object_exists_by_key(
         &self,
         object_id: &ObjectID,
         version: SequenceNumber,
     ) -> SuiResult<bool> {
-        if self
-            .get_object_by_key_cache_only(object_id, version)
-            .is_some()
-        {
-            return Ok(true);
+        match self.get_object_by_key_cache_only(object_id, version) {
+            CacheResult::Hit(_) => Ok(true),
+            CacheResult::NegativeHit => Ok(false),
+            CacheResult::Miss => self.store.object_exists_by_key(object_id, version),
         }
     }
 
@@ -719,11 +750,13 @@ impl ExecutionCacheRead for InMemoryCache {
         let mut fetch_indices = Vec::with_capacity(object_keys.len());
 
         for (i, key) in object_keys.iter().enumerate() {
-            if self.object_exists_by_key(&key.0, key.1)? {
-                results[i] = true;
-            } else {
-                fallback_keys.push(*key);
-                fetch_indices.push(i);
+            match self.get_object_by_key_cache_only(&key.0, key.1) {
+                CacheResult::Hit(_) => results[i] = true,
+                CacheResult::NegativeHit => (),
+                CacheResult::Miss => {
+                    fallback_keys.push(*key);
+                    fetch_indices.push(i);
+                }
             }
         }
 
@@ -764,12 +797,50 @@ impl ExecutionCacheRead for InMemoryCache {
                 return Ok(Some((objref.into(), ObjectOrTombstone::Tombstone(objref))));
             } else {
                 let key: ObjectKey = objref.into();
-                let object = self.get_object_by_key(&objref.0, objref.1)?;
+                let object = ExecutionCacheRead::get_object_by_key(self, &objref.0, objref.1)?;
                 return Ok(object.map(|o| (key, o.into())));
             }
         }
 
         self.store.get_latest_object_or_tombstone(object_id)
+    }
+
+    fn find_object_lt_or_eq_version(
+        &self,
+        object_id: ObjectID,
+        version: SequenceNumber,
+    ) -> Option<Object> {
+        // Both self.objects and self.object_cache have no gaps, and self.object_cache
+        // cannot have a more recent version than self.objects.
+        // note that while binary searching would be more efficient for random keys, child
+        // reads will be disproportionately more likely to be for a very recent version.
+        if let Some(objects) = self.objects.get(&object_id) {
+            for (_, object) in objects.range(..=version).rev() {
+                if let ObjectEntry::Object(object) = object {
+                    return Some(object.clone());
+                }
+            }
+        }
+
+        if let Some(objects) = self.object_cache.get(&object_id) {
+            let objects = objects.lock();
+            for (_, object) in objects.range(..=version).rev() {
+                if let ObjectEntry::Object(object) = object {
+                    return Some(object.clone());
+                }
+            }
+        }
+
+        self.store.find_object_lt_or_eq_version(object_id, version)
+    }
+
+    fn get_latest_lock_for_object_id(&self, object_id: ObjectID) -> SuiResult<ObjectRef> {
+        // TODO(cache) - read lock from cache
+        let lock = self
+            .store
+            .get_latest_lock_for_object_id(object_id)
+            .expect("read cannot fail");
+        Ok(lock)
     }
 
     fn multi_get_transaction_blocks(
@@ -889,7 +960,8 @@ impl ExecutionCacheRead for InMemoryCache {
     }
 
     fn get_sui_system_state_object_unsafe(&self) -> SuiResult<SuiSystemState> {
-        get_sui_system_state(&ObjectStoreWrapper(self))
+        todo!()
+        //get_sui_system_state(&self.clone().as_backing_store())
     }
 
     fn get_marker_value(
@@ -1080,12 +1152,9 @@ impl EffectsNotifyRead for NotifyReadWrapper {
     }
 }
 
-// Wrapper to avoid having to disambiguate traits everywhere
-struct ObjectStoreWrapper<'a>(&'a InMemoryCache);
-
-impl<'a> ObjectStore for ObjectStoreWrapper<'a> {
+impl ObjectStore for InMemoryCache {
     fn get_object(&self, object_id: &ObjectID) -> Result<Option<Object>, SuiError> {
-        self.0.get_object(object_id)
+        ExecutionCacheRead::get_object(self, object_id)
     }
 
     fn get_object_by_key(
@@ -1093,6 +1162,80 @@ impl<'a> ObjectStore for ObjectStoreWrapper<'a> {
         object_id: &ObjectID,
         version: sui_types::base_types::VersionNumber,
     ) -> Result<Option<Object>, SuiError> {
-        self.0.get_object_by_key(object_id, version)
+        ExecutionCacheRead::get_object_by_key(self, object_id, version)
+    }
+}
+
+impl ChildObjectResolver for InMemoryCache {
+    fn read_child_object(
+        &self,
+        parent: &ObjectID,
+        child: &ObjectID,
+        child_version_upper_bound: SequenceNumber,
+    ) -> SuiResult<Option<Object>> {
+        let Some(child_object) =
+            self.find_object_lt_or_eq_version(*child, child_version_upper_bound)
+        else {
+            return Ok(None);
+        };
+
+        let parent = *parent;
+        if child_object.owner != Owner::ObjectOwner(parent.into()) {
+            return Err(SuiError::InvalidChildObjectAccess {
+                object: *child,
+                given_parent: parent,
+                actual_owner: child_object.owner,
+            });
+        }
+        Ok(Some(child_object))
+    }
+
+    fn get_object_received_at_version(
+        &self,
+        owner: &ObjectID,
+        receiving_object_id: &ObjectID,
+        receive_object_at_version: SequenceNumber,
+        epoch_id: EpochId,
+    ) -> SuiResult<Option<Object>> {
+        let Some(recv_object) = ExecutionCacheRead::get_object_by_key(
+            self,
+            receiving_object_id,
+            receive_object_at_version,
+        )?
+        else {
+            return Ok(None);
+        };
+
+        // Check for:
+        // * Invalid access -- treat as the object does not exist. Or;
+        // * If we've already received the object at the version -- then treat it as though it doesn't exist.
+        // These two cases must remain indisguishable to the caller otherwise we risk forks in
+        // transaction replay due to possible reordering of transactions during replay.
+        if recv_object.owner != Owner::AddressOwner((*owner).into())
+            || self.have_received_object_at_version(
+                receiving_object_id,
+                receive_object_at_version,
+                epoch_id,
+            )?
+        {
+            return Ok(None);
+        }
+
+        Ok(Some(recv_object))
+    }
+}
+
+impl BackingPackageStore for InMemoryCache {
+    fn get_package_object(&self, package_id: &ObjectID) -> SuiResult<Option<PackageObject>> {
+        ExecutionCacheRead::get_package_object(self, package_id)
+    }
+}
+
+impl ParentSync for InMemoryCache {
+    fn get_latest_parent_entry_ref_deprecated(
+        &self,
+        object_id: ObjectID,
+    ) -> SuiResult<Option<ObjectRef>> {
+        ExecutionCacheRead::get_latest_object_ref_or_tombstone(self, object_id)
     }
 }
