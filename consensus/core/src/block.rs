@@ -196,6 +196,14 @@ impl Slot {
     pub fn new(round: Round, authority: AuthorityIndex) -> Self {
         Self { round, authority }
     }
+
+    #[cfg(test)]
+    pub fn new_for_test(round: Round, authority: u32) -> Self {
+        Self {
+            round,
+            authority: AuthorityIndex::new_for_test(authority),
+        }
+    }
 }
 
 impl From<BlockRef> for Slot {

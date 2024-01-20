@@ -3,6 +3,7 @@
 
 use std::{collections::HashMap, fmt::Display, sync::Arc};
 
+use consensus_config::{AuthorityIndex, Stake};
 use parking_lot::RwLock;
 
 use crate::{
@@ -13,8 +14,6 @@ use crate::{
     leader_schedule::LeaderSchedule,
     stake_aggregator::{QuorumThreshold, StakeAggregator},
 };
-
-use consensus_config::{AuthorityIndex, Stake};
 
 #[allow(unused)]
 pub(crate) struct BaseCommitterOptions {
