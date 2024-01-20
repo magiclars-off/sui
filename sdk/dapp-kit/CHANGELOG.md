@@ -1,5 +1,36 @@
 # @mysten/dapp-kit
 
+## 0.12.0
+
+### Minor Changes
+
+- 7b8d044603: Add support for zkSend wallet
+
+### Patch Changes
+
+- Updated dependencies [c07aa19958]
+- Updated dependencies [c859f41a1c]
+- Updated dependencies [d21c01ed47]
+- Updated dependencies [2814db6529]
+- Updated dependencies [e81f49e8dc]
+- Updated dependencies [e87d99734a]
+- Updated dependencies [9a14e61db4]
+- Updated dependencies [ba6fccd010]
+- Updated dependencies [c6b3066069]
+- Updated dependencies [66fbbc7faa]
+- Updated dependencies [7b8d044603]
+- Updated dependencies [c6b3066069]
+- Updated dependencies [ea2744b0c3]
+- Updated dependencies [44a1f9ea0b]
+- Updated dependencies [7cc09a7bb4]
+- Updated dependencies [9a14e61db4]
+- Updated dependencies [f041b10b9f]
+- Updated dependencies [c1f6cfff47]
+- Updated dependencies [ae9ae17eea]
+  - @mysten/zksend@0.2.0
+  - @mysten/sui.js@0.49.2
+  - @mysten/wallet-standard@0.10.2
+
 ## 0.11.1
 
 ### Patch Changes

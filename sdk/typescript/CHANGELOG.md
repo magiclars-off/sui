@@ -1,5 +1,11 @@
 # @mysten/sui.js
 
+## 0.49.2
+
+### Patch Changes
+
+- 9a14e61db4: Allow signer in signAndExecuteTransactionBlock to be a Signer rather than a Keypair
+
 ## 0.49.1
 
 ### Patch Changes
